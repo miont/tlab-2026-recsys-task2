@@ -1,0 +1,23 @@
+# Base experiment config; see src/recsys_rl/config.py for all fields and defaults.
+seed: 42
+run_name: base
+data:
+  dataset_size: 50m
+  test_days: 1
+  val_days: 1
+  gap_minutes: 30
+  max_vocab_size: 200000
+  max_seq_len: 256
+model:
+  n_layer: 4
+  n_head: 4
+  n_embd: 256
+train:
+  batch_size: 128
+  lr: 0.001
+  epochs: 5
+rl:
+  method: rloo
+  reward: ratio
+  group_size: 16
+  kl_beta: 0.1

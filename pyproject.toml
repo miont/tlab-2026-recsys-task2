@@ -1,7 +1,53 @@
 [project]
 name = "tlab-2026-recsys-task2"
 version = "0.1.0"
-description = "Add your description here"
+description = "RL fine-tuning of a GPT-2 sequential recommender on Yambda-50M"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.13"
+# Lower bounds are deliberately loose so that `pip install -e .` in Google Colab
+# reuses the preinstalled torch/numpy instead of reinstalling them.
+# Exact local versions are pinned in uv.lock.
+dependencies = [
+    "huggingface-hub>=0.25",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "polars>=1.0",
+    "pyarrow>=15.0",
+    "pyyaml>=6.0",
+    "scipy>=1.11",
+    "torch>=2.4",
+    "tqdm>=4.66",
+    "transformers>=4.45",
+]
+
+[project.optional-dependencies]
+tracking = [
+    "wandb>=0.18",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+]
+
+[project.scripts]
+yambda-download = "recsys_rl.cli.download:main"
+
+[build-system]
+requires = ["uv_build>=0.11.3,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "recsys_rl"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
