@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Research project: RL fine-tuning of a GPT-2 next-item recommender on Yambda-50M (Yandex Music). The task statement is `docs/task.md`; the full research plan (stages 0–7, evaluation protocol, reward variants R1–R6, risks) is `docs/codeagents/research_plan.md` — read the relevant section before implementing a stage. Docs and README are in Russian; code, comments and docstrings are in English.
 
-Status: stage 0 (infrastructure) is done; stage 1 is in progress. `config.py`, `utils.py`, `cli/download.py` and `metrics.py` are implemented; `data.py` has loading, split, Listen+, sessions, vocabulary and eval targets (feedback bins and windows wait for the EDA). `model.py`, `reward_model.py`, `rewards.py`, `rl.py`, `generate.py` are docstring-only stubs that describe what each stage must provide.
+Status: stage 0 (infrastructure) is done; stage 1 is in progress. `config.py`, `utils.py`, `cli/download.py` and `metrics.py` are implemented; `data.py` has loading, split, Listen+, sessions, vocabulary and eval targets; `eda.py` + `notebooks/01_eda.ipynb` hold the EDA and its findings (next: feedback bins and training windows in `data.py`). `model.py`, `reward_model.py`, `rewards.py`, `rl.py`, `generate.py` are docstring-only stubs that describe what each stage must provide.
 
 ## Commands
 
