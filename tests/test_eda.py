@@ -1,11 +1,11 @@
 import polars as pl
 
-from recsys_rl import eda
+from recsys_rl import data, eda
 
 
 def test_bin_index_and_labels():
     df = pl.DataFrame({"x": [-3, 0, 5, 6, 100, 101]})
-    bins = df.select(eda.bin_index(pl.col("x"), [0, 5, 100]))["bin"].to_list()
+    bins = df.select(data.bin_index(pl.col("x"), [0, 5, 100]))["bin"].to_list()
     assert bins == [0, 0, 1, 2, 2, 3]
     assert eda.bin_labels([0, 5, 100]) == ["(-inf, 0]", "(0, 5]", "(5, 100]", "(100, inf]"]
 

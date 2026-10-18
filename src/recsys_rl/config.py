@@ -30,6 +30,11 @@ class DataConfig:
     max_seq_len: int = 256
     window_stride: int = 128
     session_gap_minutes: int = 30
+    # Feature bins: bin i holds edges[i-1] < x <= edges[i] (len(edges) + 1 bins); chosen in the EDA.
+    # Played ratio is bimodal (53% full plays, 24% <= 5%), so the edges follow its shape.
+    ratio_bin_edges: list[int] = field(default_factory=lambda: [0, 5, 10, 25, 49, 75, 99, 100])
+    # Roughly train quantiles of track length in seconds (median 200 s, 5-95%: 125-310 s).
+    length_bin_edges: list[int] = field(default_factory=lambda: [120, 150, 180, 210, 240, 300])
 
 
 @dataclass
@@ -39,8 +44,8 @@ class ModelConfig:
     n_embd: int = 256
     dropout: float = 0.1
     use_feedback_tokens: bool = True
-    n_ratio_bins: int = 12
-    n_length_bins: int = 7
+    n_ratio_bins: int = 9  # len(DataConfig.ratio_bin_edges) + 1
+    n_length_bins: int = 7  # len(DataConfig.length_bin_edges) + 1
 
 
 @dataclass

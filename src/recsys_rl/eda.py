@@ -15,16 +15,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 
-from recsys_rl.data import DAY_SECONDS, add_session_ids, is_listen, is_listen_plus
+from recsys_rl.data import DAY_SECONDS, add_session_ids, bin_index, is_listen, is_listen_plus
 
 RATIO = pl.col("played_ratio_pct")
 RATIO_CLIPPED = RATIO.clip(0, 100)
 LENGTH = pl.col("track_length_seconds")
-
-
-def bin_index(expr: pl.Expr, edges: Sequence[float]) -> pl.Expr:
-    """Bin number ``i`` such that ``edges[i-1] < x <= edges[i]`` (0 below the first edge)."""
-    return pl.sum_horizontal([(expr > e).cast(pl.UInt8) for e in edges]).alias("bin")
 
 
 def bin_labels(edges: Sequence[float]) -> list[str]:
