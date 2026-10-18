@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Research project: RL fine-tuning of a GPT-2 next-item recommender on Yambda-50M (Yandex Music). The task statement is `docs/task.md`; the full research plan (stages 0–7, evaluation protocol, reward variants R1–R6, risks) is `docs/codeagents/research_plan.md` — read the relevant section before implementing a stage. Docs and README are in Russian; code, comments and docstrings are in English.
 
-Status: stage 0 (infrastructure) is done. `config.py`, `utils.py` and `cli/download.py` are implemented; `data.py`, `metrics.py`, `model.py`, `reward_model.py`, `rewards.py`, `rl.py`, `generate.py` are docstring-only stubs that describe what each stage must provide.
+Status: stage 0 (infrastructure) is done; stage 1 is in progress. `config.py`, `utils.py`, `cli/download.py` and `metrics.py` are implemented; `data.py` has loading, split, Listen+, sessions, vocabulary and eval targets (feedback bins and windows wait for the EDA). `model.py`, `reward_model.py`, `rewards.py`, `rl.py`, `generate.py` are docstring-only stubs that describe what each stage must provide.
 
 ## Commands
 
@@ -36,8 +36,8 @@ Tests load `configs/base.yaml` by relative path, so run pytest from the repo roo
 
 ## Evaluation protocol (leak-prevention rules from the plan, §3)
 
-- Global Temporal Split: train | val day | 30-min gap | test day. Val is used for hyperparameter/early stopping, including RL β and step selection.
+- Global Temporal Split (as in the Yambda benchmarks): train | 30-min gap | val day | 30-min gap | test day; test is the last day before timestamp 26_000_000 (seconds). Val/test keep only train users. Val is used for hyperparameter/early stopping, including RL β and step selection.
 - Vocabulary, popularity, per-track mean ratio and length normalisation are computed **on train only**. Reward models are trained on train only; RL contexts come from train, RL validation on the val day.
 - Reward-model features for event t use only events < t.
 - Relevance target is Listen+ (played ratio ≥ 0.5). The repeat filter (not recommending already-heard items) is a separate, explicitly reported evaluation mode, never hidden post-processing.
-- Sanity check: SASRec on Yambda-50M Listen+ reaches NDCG@10 = 0.0748, Recall@10 = 0.0325, Recall@100 = 0.1026; much lower GPT-2 numbers indicate a pipeline bug.
+- Sanity check: SASRec on Yambda-50M Listen+ reaches NDCG@10 = 0.0748, Recall@10 = 0.0325, Recall@100 = 0.1026; much lower GPT-2 numbers indicate a pipeline bug. These paper numbers use buggy formulas (recall over target events, pooled NDCG), so compare them with `metrics.yambda_paper_metrics`, not `relevance_metrics`.
