@@ -56,8 +56,14 @@ class TrainConfig:
     epochs: int = 5
     warmup_steps: int = 500
     n_negatives: int = 8192
+    grad_clip: float = 1.0
     amp: bool = True
+    # Next-item target: "all" (every listen, the task statement) or "listen_plus"
+    # (only Listen+ targets contribute to the loss, next-positive ablation).
+    target: str = "all"
     eval_every: int = 1000
+    patience: int = 5  # early stopping: evaluations without a val NDCG@10 improvement
+    max_steps: int = 0  # 0 = run all epochs; > 0 caps the run (smoke tests)
 
 
 @dataclass
@@ -108,13 +114,43 @@ def _from_dict(cls: type, values: dict[str, Any]) -> Any:
     return cls(**kwargs)
 
 
+def _merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            value = _merge(out[key], value)
+        out[key] = value
+    return out
+
+
 def load_config(path: str | Path | None = None, **overrides: Any) -> Config:
-    """Load a YAML config; top-level ``overrides`` are applied on top."""
+    """Load a YAML config; ``overrides`` are merged on top (nested dicts key by key, so
+    ``train={"lr": 3e-4}`` keeps the other ``train`` values of the file)."""
     values: dict[str, Any] = {}
     if path is not None:
         values = yaml.safe_load(Path(path).read_text()) or {}
-    values.update(overrides)
-    return _from_dict(Config, values)
+    return _from_dict(Config, _merge(values, overrides))
+
+
+def parse_overrides(items: list[str]) -> dict[str, Any]:
+    """``["train.lr=3e-4", "run_name=x"]`` -> nested dict; values are parsed as YAML."""
+    out: dict[str, Any] = {}
+    for item in items:
+        key, sep, raw = item.partition("=")
+        if not sep:
+            raise ValueError(f"override {item!r} is not key=value")
+        *parents, leaf = key.split(".")
+        node = out
+        for name in parents:
+            node = node.setdefault(name, {})
+        value = yaml.safe_load(raw)
+        if isinstance(value, str):
+            try:
+                value = float(value)  # PyYAML (YAML 1.1) reads "3e-4" as a string
+            except ValueError:
+                pass
+        node[leaf] = value
+    return out
 
 
 def save_config(cfg: Config, path: str | Path) -> None:

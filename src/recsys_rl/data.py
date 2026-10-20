@@ -283,6 +283,13 @@ class EventStore:
         columns = {c: np.load(directory / f"{c}.npy", mmap_mode=mode) for c in EVENT_COLUMNS}
         return cls(np.load(directory / "uids.npy"), np.load(directory / "offsets.npy"), columns)
 
+    def in_memory(self) -> EventStore:
+        """Copy memmapped columns to RAM (~1.7 GB for 50M): random window reads from a
+        memmap on Google Drive go through FUSE and are slow."""
+        return EventStore(
+            self.uids, self.offsets, {c: np.array(v) for c, v in self.columns.items()}
+        )
+
     def cutoff_index(self, cutoff: int) -> np.ndarray:
         """Per user, the first row with ``timestamp >= cutoff`` (absolute row index)."""
         ts = self.columns["timestamp"]

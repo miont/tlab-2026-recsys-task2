@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Research project: RL fine-tuning of a GPT-2 next-item recommender on Yambda-50M (Yandex Music). The task statement is `docs/task.md`; the full research plan (stages 0–7, evaluation protocol, reward variants R1–R6, risks) is `docs/codeagents/research_plan.md` — read the relevant section before implementing a stage. Docs and README are in Russian; code, comments and docstrings are in English.
 
-Status: stage 0 (infrastructure) is done; stage 1 is in progress. `config.py`, `utils.py`, `cli/download.py` and `metrics.py` are implemented; `data.py` has loading, split, Listen+, sessions, vocabulary, eval targets, feedback bins, like/dislike attribution, the `EventStore` (memmapped per-listen arrays, train windows, eval contexts, leak-free `gather`) and the cached `prepare(cfg)`; `eda.py` + `notebooks/01_eda.ipynb` hold the EDA and its findings. Next: stage 2 (`model.py`, GPT-2 base recommender). `model.py`, `reward_model.py`, `rewards.py`, `rl.py`, `generate.py` are docstring-only stubs that describe what each stage must provide.
+Status: stages 0–1 are done; stage 2 code is implemented, training runs on Colab are pending. `config.py`, `utils.py`, `cli/download.py` and `metrics.py` are implemented; `data.py` has loading, split, Listen+, sessions, vocabulary, eval targets, feedback bins, like/dislike attribution, the `EventStore` (memmapped per-listen arrays, train windows, eval contexts, leak-free `gather`) and the cached `prepare(cfg)`; `eda.py` + `notebooks/01_eda.ipynb` hold the EDA and its findings. Stage 2: `model.py` (`GPT2Recommender`, sampled softmax + logQ, `save_model`/`load_model`), `train.py` (resumable training loop, early stopping on val NDCG@10), `evaluate.py` (val/test eval sets from the `EventStore`, model / MostPop / Repeat recommenders, `results_table`), `cli/train_base.py` (`yambda-train`) and `notebooks/02_baseline.ipynb`. Next: run stage 2 on a Colab GPU (base + ablations), then stage 3 (`reward_model.py`). `reward_model.py`, `rewards.py`, `rl.py`, `generate.py` are docstring-only stubs that describe what each stage must provide. The local GTX 1070 (sm_61) is not supported by the installed torch build, so locally everything runs on CPU (tests, smoke runs); real training happens on Colab.
 
 ## Commands
 
@@ -21,7 +21,10 @@ uv run ruff check .                       # lint (E, F, I, UP, B; line length 10
 uv run ruff format .
 uv run yambda-download                    # flat/50m/multi_event + artist/album mappings (~0.5 GB)
 uv run yambda-download --embeddings       # + audio embeddings (~13.8 GB)
+uv run yambda-train [--config configs/base.yaml] [key=value ...]   # stage 2, e.g. train.lr=3e-4
 ```
+
+`key=value` overrides (also `config.parse_overrides`) are merged into the YAML values, so `train.lr=3e-4` keeps the other `train` fields of the file. A run resumes from `runs/<run_name>/last.pt`; `train.max_steps=N` caps it for smoke tests.
 
 Tests load `configs/base.yaml` by relative path, so run pytest from the repo root.
 
@@ -40,4 +43,4 @@ Tests load `configs/base.yaml` by relative path, so run pytest from the repo roo
 - Vocabulary, popularity, per-track mean ratio and length normalisation are computed **on train only**. Reward models are trained on train only; RL contexts come from train, RL validation on the val day.
 - Reward-model features for event t use only events < t.
 - Relevance target is Listen+ (played ratio ≥ 0.5). The repeat filter (not recommending already-heard items) is a separate, explicitly reported evaluation mode, never hidden post-processing.
-- Sanity check: SASRec on Yambda-50M Listen+ reaches NDCG@10 = 0.0748, Recall@10 = 0.0325, Recall@100 = 0.1026; much lower GPT-2 numbers indicate a pipeline bug. These paper numbers use buggy formulas (recall over target events, pooled NDCG), so compare them with `metrics.yambda_paper_metrics`, not `relevance_metrics`.
+- Sanity check: SASRec on Yambda-50M Listen+ reaches NDCG@10 = 0.0748, Recall@10 = 0.0325, Recall@100 = 0.1026; much lower GPT-2 numbers indicate a pipeline bug. These paper numbers use buggy formulas (recall over target events, pooled NDCG), so compare them with `metrics.yambda_paper_metrics`, not `relevance_metrics`. Repeats dominate this dataset: the Repeat baseline (most recent distinct tracks of the user) already reaches paper NDCG@10 ≈ 0.135 / paper Recall@100 ≈ 0.23 on val and test, MostPop ≈ 0.026, so the GPT-2 should be compared with Repeat too.

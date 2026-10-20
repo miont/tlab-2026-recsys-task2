@@ -14,11 +14,14 @@ src/recsys_rl/
   data.py           загрузка, Global Temporal Split, словарь, окна       (этап 1)
   metrics.py        Recall/NDCG/MAP, Coverage, Gini, повторы, ILD         (этап 1)
   model.py          GPT-2 next-item рекомендатель (π_ref)                 (этап 2)
+  train.py          обучение базовой модели: sampled softmax, early stop   (этап 2)
+  evaluate.py       оценка на val/test, бейзлайны MostPop и Repeat        (этап 2)
   reward_model.py   модель отклика: ratio / listen+ / skip / like         (этап 3)
   rewards.py        функции награды R1–R6                                 (этапы 4–6)
   rl.py             RLOO/GRPO + KL, off-policy REINFORCE, DPO             (этапы 4–5)
   generate.py       top-K, reranking, multi-step роллауты                 (этап 6)
   cli/download.py   загрузка Yambda с Hugging Face
+  cli/train_base.py обучение и оценка базовой модели (yambda-train)
 tests/              pytest
 ```
 
