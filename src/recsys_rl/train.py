@@ -50,7 +50,7 @@ def build_model(cfg: Config, n_items: int) -> GPT2Recommender:
     return GPT2Recommender(cfg.model, n_items, cfg.data.max_seq_len)
 
 
-def make_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
+def make_optimizer(model: nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
     """AdamW; weight decay only on transformer matrices (not embeddings, biases, LayerNorms):
     decaying the item table every step would shrink rarely seen items."""
     embeddings = {id(m.weight) for m in model.modules() if isinstance(m, nn.Embedding)}
@@ -58,10 +58,10 @@ def make_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
     for p in model.parameters():
         (decay if p.ndim >= 2 and id(p) not in embeddings else no_decay).append(p)
     groups = [
-        {"params": decay, "weight_decay": cfg.train.weight_decay},
+        {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return torch.optim.AdamW(groups, lr=cfg.train.lr)
+    return torch.optim.AdamW(groups, lr=lr)
 
 
 def lr_lambda(warmup: int, total: int):
@@ -129,7 +129,7 @@ def train(
     min_ratio = round(cfg.data.listen_plus_threshold * 100)
 
     model = build_model(cfg, n_items).to(device)
-    optimizer = make_optimizer(model, cfg)
+    optimizer = make_optimizer(model, t.lr, t.weight_decay)
     n_windows = len(prepared.window_starts)
     batches_per_epoch = n_windows // t.batch_size
     if batches_per_epoch == 0:

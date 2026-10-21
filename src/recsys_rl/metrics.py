@@ -3,6 +3,7 @@
 Relevance: Recall@K, NDCG@K, MAP@K on Listen+ / Like targets.
 Beyond-accuracy: Coverage@K, Gini, mean pairwise Jaccard of top-K lists across users,
 repeat rate (share of items from user history), mean popularity, mean track length, ILD.
+Reward-model quality (stage 3): ROC-AUC, average precision (PR-AUC), calibration bins and ECE.
 
 Conventions:
 - ``recs`` is an ``int`` array ``[n_users, K_max]`` of item ids, best first, unique within a row.
@@ -27,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import numpy as np
+from scipy.stats import rankdata
 
 
 def _check(recs: np.ndarray, k: int) -> np.ndarray:
@@ -176,3 +178,61 @@ def ild(recs: np.ndarray, embeddings: np.ndarray, k: int, batch_size: int = 1024
         off_diag = sim.sum((1, 2)) - np.trace(sim, axis1=1, axis2=2)
         per_user.append(1.0 - off_diag / (k * (k - 1)))
     return float(np.mean(np.concatenate(per_user)))
+
+
+def _binary(y_true: np.ndarray, y_score: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    y, p = np.asarray(y_true, dtype=bool).ravel(), np.asarray(y_score, dtype=np.float64).ravel()
+    if len(y) != len(p):
+        raise ValueError(f"{len(y)} labels for {len(p)} scores")
+    return y, p
+
+
+def roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """ROC-AUC via the Mann-Whitney statistic (ties count 1/2); NaN without both classes."""
+    y, p = _binary(y_true, y_score)
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    ranks = rankdata(p)
+    return float((ranks[y].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+
+def average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """PR-AUC as average precision, sum over thresholds of (R_n - R_{n-1}) * P_n
+    (tied scores form one threshold, as in scikit-learn); NaN without positives."""
+    y, p = _binary(y_true, y_score)
+    if not y.any():
+        return float("nan")
+    order = np.argsort(-p, kind="stable")
+    y, p = y[order], p[order]
+    last = np.r_[np.flatnonzero(np.diff(p)), len(p) - 1]  # last index of each distinct score
+    tp = np.cumsum(y)[last]
+    precision = tp / (last + 1)
+    recall_step = np.diff(np.r_[0, tp]) / tp[-1]
+    return float((recall_step * precision).sum())
+
+
+def calibration_bins(
+    y_true: np.ndarray, y_pred: np.ndarray, n_bins: int = 10
+) -> dict[str, np.ndarray]:
+    """Reliability diagram data: equal-width bins of the prediction in [0, 1].
+
+    Returns per-bin ``count``, ``mean_pred`` and ``mean_true`` (NaN for empty bins);
+    ``y_true`` may be soft (the played ratio).
+    """
+    y, p = np.asarray(y_true, dtype=np.float64).ravel(), np.asarray(y_pred, np.float64).ravel()
+    b = np.clip((p * n_bins).astype(np.int64), 0, n_bins - 1)
+    count = np.bincount(b, minlength=n_bins)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean_pred = np.bincount(b, weights=p, minlength=n_bins) / count
+        mean_true = np.bincount(b, weights=y, minlength=n_bins) / count
+    return {"count": count, "mean_pred": mean_pred, "mean_true": mean_true}
+
+
+def expected_calibration_error(y_true: np.ndarray, y_pred: np.ndarray, n_bins: int = 10) -> float:
+    """Count-weighted mean |mean_pred - mean_true| over the bins of ``calibration_bins``."""
+    c = calibration_bins(y_true, y_pred, n_bins)
+    nonempty = c["count"] > 0
+    gap = np.abs(c["mean_pred"] - c["mean_true"])[nonempty]
+    return float((gap * c["count"][nonempty]).sum() / c["count"].sum())

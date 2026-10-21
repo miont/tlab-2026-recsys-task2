@@ -21,3 +21,8 @@ rl:
   reward: ratio
   group_size: 16
   kl_beta: 0.1
+rm:
+  base_run: base
+  n_ensemble: 4
+  lr: 0.0003
+  epochs: 1

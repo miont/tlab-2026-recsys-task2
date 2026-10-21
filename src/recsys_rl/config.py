@@ -67,6 +67,29 @@ class TrainConfig:
 
 
 @dataclass
+class RewardModelConfig:
+    # Encoder initialised from runs/<base_run>/best.pt (its ModelConfig is used); null = random
+    # init from Config.model (the gold RM, to be less correlated with the proxy).
+    base_run: str | None = "base"
+    n_ensemble: int = 4  # MLP heads on a shared encoder; their spread = epistemic uncertainty
+    head_hidden: int = 256
+    audio_embeddings: bool = False  # needs raw/embeddings.parquet (yambda-download --embeddings)
+    user_fraction: float = 1.0  # share of train users whose windows are used (seeded subsample)
+    bootstrap: bool = True  # Poisson(1) weight per (window, ensemble member)
+    skip_threshold: float = 0.3  # skip target: played ratio below it
+    batch_size: int = 128
+    lr: float = 3e-4
+    weight_decay: float = 0.01
+    epochs: int = 1
+    warmup_steps: int = 200
+    grad_clip: float = 1.0
+    amp: bool = True
+    eval_every: int = 1000
+    patience: int = 3  # early stopping: evaluations without a val loss improvement
+    max_steps: int = 0  # 0 = run all epochs; > 0 caps the run (smoke tests)
+
+
+@dataclass
 class RLConfig:
     method: str = "rloo"  # rloo | grpo | offpolicy_reinforce | dpo
     reward: str = "ratio"  # ratio | listen_time | like_ratio | debiased_ratio | ...
@@ -87,6 +110,7 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    rm: RewardModelConfig = field(default_factory=RewardModelConfig)
     rl: RLConfig = field(default_factory=RLConfig)
 
     @property

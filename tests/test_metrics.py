@@ -69,3 +69,26 @@ def test_ild():
     emb = np.array([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]])
     assert metrics.ild(np.array([[0, 1]]), emb, k=2) == pytest.approx(1.0)
     assert metrics.ild(np.array([[0, 1], [0, 2]]), emb, k=2, batch_size=1) == pytest.approx(0.5)
+
+
+def test_roc_auc_and_average_precision():
+    y = np.array([1, 0, 1, 0, 1])
+    p = np.array([0.9, 0.8, 0.7, 0.3, 0.3])
+    # pairs (pos, neg): 0.9>0.8, 0.9>0.3, 0.7<0.8, 0.7>0.3, 0.3<0.8, 0.3=0.3 -> 3.5 + ... / 6
+    assert metrics.roc_auc(y, p) == pytest.approx((1 + 1 + 0 + 1 + 0 + 0.5) / 6)
+    assert np.isnan(metrics.roc_auc([1, 1], [0.1, 0.2]))
+    # thresholds 0.9, 0.8, 0.7, 0.3 (tie of a positive and a negative): P = 1, 1/2, 2/3, 3/5
+    assert metrics.average_precision(y, p) == pytest.approx((1 + 2 / 3 + 3 / 5) / 3)
+    assert metrics.average_precision([0, 1], [0.0, 1.0]) == 1.0
+    assert np.isnan(metrics.average_precision([0, 0], [0.1, 0.2]))
+
+
+def test_calibration():
+    y = np.array([0.0, 1.0, 1.0, 1.0])
+    p = np.array([0.05, 0.15, 0.95, 1.0])
+    c = metrics.calibration_bins(y, p, n_bins=10)
+    assert c["count"].tolist() == [1, 1, 0, 0, 0, 0, 0, 0, 0, 2]
+    assert c["mean_true"][[0, 1, 9]].tolist() == [0.0, 1.0, 1.0]
+    assert np.isnan(c["mean_pred"][5])
+    ece = metrics.expected_calibration_error(y, p, n_bins=10)
+    assert ece == pytest.approx((0.05 + 0.85 + 2 * 0.025) / 4)

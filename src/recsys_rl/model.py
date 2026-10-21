@@ -77,11 +77,18 @@ class GPT2Recommender(nn.Module):
         with torch.no_grad():
             self.item_emb.weight[PAD_IDX].zero_()
 
-    def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """Hidden states ``[B, T, d]``; position ``t`` is the query for the item at ``t + 1``."""
+    def forward(
+        self, batch: Mapping[str, torch.Tensor], extra: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Hidden states ``[B, T, d]``; position ``t`` is the query for the item at ``t + 1``.
+
+        ``extra`` (``[B, T, d]``) is added to the input embeddings (the reward model's audio
+        features)."""
         x = self.item_emb(batch["item_idx"])
         for name, emb in self.feature_emb.items():
             x = x + emb(batch[name])
+        if extra is not None:
+            x = x + extra
         return self.backbone(inputs_embeds=x).last_hidden_state
 
     def scores(self, hidden: torch.Tensor) -> torch.Tensor:

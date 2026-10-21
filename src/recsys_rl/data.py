@@ -337,7 +337,8 @@ class EventStore:
         self, starts: np.ndarray, lengths: np.ndarray, seq_len: int, cutoff: int
     ) -> dict[str, np.ndarray]:
         """Right-padded ``[B, seq_len]`` batch of every column plus ``mask`` and the
-        leak-free input flags ``liked`` / ``disliked``.
+        leak-free input flags ``liked`` / ``disliked``. The raw ``*_delay`` columns stay in the
+        batch for feedback *targets* (``reward_model.feedback_targets``), never as inputs.
 
         A like/dislike counts as an input feature of a listen only if it was given before the
         user's next listen started and before ``cutoff`` (the end of the period whose events
@@ -351,7 +352,7 @@ class EventStore:
         ts = batch["timestamp"].astype(np.int64)
         next_gap = batch["next_gap"]
         for name in ("like", "dislike"):
-            delay = batch.pop(f"{name}_delay")
+            delay = batch[f"{name}_delay"]
             seen = (delay >= 0) & ((delay < next_gap) | (next_gap < 0)) & (ts + delay < cutoff)
             batch[f"{name}d"] = (seen & mask).astype(np.uint8)
         batch["item_idx"] = np.where(mask, batch["item_idx"], PAD_IDX)
