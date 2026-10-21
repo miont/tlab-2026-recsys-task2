@@ -8,6 +8,7 @@
 configs/            YAML-конфиги экспериментов (base.yaml)
 docs/               задание и план исследования
 notebooks/          тонкие точки входа для Google Colab
+results/            итоговые таблицы (CSV) и графики (PNG) по этапам, из Colab
 src/recsys_rl/
   config.py         dataclass-конфиги, загрузка/сохранение YAML
   utils.py          сиды, выбор устройства, атомарные чекпоинты

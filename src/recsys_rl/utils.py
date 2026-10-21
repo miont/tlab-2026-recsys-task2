@@ -38,3 +38,10 @@ def save_checkpoint(path: str | Path, **state: Any) -> None:
 
 def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> dict[str, Any]:
     return torch.load(path, map_location=map_location, weights_only=False)
+
+
+def save_figure(fig: Any, path: str | Path, dpi: int = 150) -> None:
+    """Save a matplotlib figure (creating the directory) for the report."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")

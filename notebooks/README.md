@@ -12,3 +12,5 @@ Notebooks are thin entry points for Google Colab; all logic lives in `src/recsys
 | `05_analysis.ipynb` | 5–6. Trade-off, behaviour change, multi-step rollouts |
 
 Each Colab notebook runs in its own runtime, so every notebook after `00` starts with the same bootstrap cell (mount Drive, clone, install, fix `sys.path`); locally that cell only changes the working directory to the repo root. The bootstrap installs the code from GitHub, so push changes before running a notebook in Colab.
+
+Report artifacts: notebooks 02 and later write their final tables (CSV) and plots (PNG) to `results/<stage>/` under `RECSYS_DATA_ROOT` (`MyDrive/tlab-recsys/results/` in Colab). After a run, download that folder into the repo's `results/` and commit it; checkpoints and logs stay on Drive. Notebooks are committed without outputs.

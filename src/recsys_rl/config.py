@@ -125,6 +125,11 @@ class Config:
     def run_dir(self) -> Path:
         return Path(self.data_root) / "runs" / self.run_name
 
+    @property
+    def results_dir(self) -> Path:
+        """Small report artifacts (CSV tables, PNG plots) collected by the notebooks."""
+        return Path(self.data_root) / "results"
+
 
 def _from_dict(cls: type, values: dict[str, Any]) -> Any:
     known = {f.name: f for f in fields(cls)}
