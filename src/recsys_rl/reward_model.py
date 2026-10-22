@@ -141,8 +141,11 @@ def load_audio_embeddings(cfg: Config, items: pl.DataFrame) -> np.ndarray:
         return np.load(cache)
     lf = pl.scan_parquet(cfg.raw_dir / "embeddings.parquet")
     col = "normalized_embed" if "normalized_embed" in lf.collect_schema().names() else "embed"
+    vocab_ids = items["item_id"].cast(pl.Int64).to_list()
     found = (
         lf.select(pl.col("item_id").cast(pl.Int64), col)
+        # filtered while scanning: the file has all 7.7M tracks, the vocabulary ~200k
+        .filter(pl.col("item_id").is_in(vocab_ids))
         .join(
             items.lazy().select(pl.col("item_id").cast(pl.Int64), "idx"),
             on="item_id",
