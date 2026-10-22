@@ -51,6 +51,8 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 from scipy.stats import spearmanr
@@ -133,33 +135,41 @@ def item_length_bins(items: pl.DataFrame, data_cfg: DataConfig) -> torch.Tensor:
     return out
 
 
-def load_audio_embeddings(cfg: Config, items: pl.DataFrame) -> np.ndarray:
+def load_audio_embeddings(cfg: Config, items: pl.DataFrame, batch_size: int = 65_536) -> np.ndarray:
     """``[n_items, d]`` float16 Yambda audio embeddings by vocabulary index (zero rows for
-    specials and items without an embedding), cached under ``processed_dir``."""
+    specials and items without an embedding), cached under ``processed_dir``.
+
+    ``embeddings.parquet`` holds all 7.7M tracks as float64 lists (~16 GB decoded), so it is
+    streamed in record batches of one column and only vocabulary rows are kept: peak memory
+    is about one row group (~0.3 GB) plus the float16 output, which fits Colab's 12 GB RAM.
+    """
     cache = cfg.processed_dir / "audio_embeddings.npy"
     if cache.exists():
         return np.load(cache)
-    lf = pl.scan_parquet(cfg.raw_dir / "embeddings.parquet")
-    col = "normalized_embed" if "normalized_embed" in lf.collect_schema().names() else "embed"
-    vocab_ids = items["item_id"].cast(pl.Int64).to_list()
-    found = (
-        lf.select(pl.col("item_id").cast(pl.Int64), col)
-        # filtered while scanning: the file has all 7.7M tracks, the vocabulary ~200k
-        .filter(pl.col("item_id").is_in(vocab_ids))
-        .join(
-            items.lazy().select(pl.col("item_id").cast(pl.Int64), "idx"),
-            on="item_id",
-            how="inner",
-        )
-        .collect()
-    )
-    if found.height == 0:
+    pf = pq.ParquetFile(cfg.raw_dir / "embeddings.parquet")
+    col = "normalized_embed" if "normalized_embed" in pf.schema_arrow.names else "embed"
+    vocab_ids = items["item_id"].to_numpy().astype(np.int64)
+    order = np.argsort(vocab_ids)
+    sorted_ids, sorted_idx = vocab_ids[order], items["idx"].to_numpy()[order].astype(np.int64)
+
+    out: np.ndarray | None = None
+    n_found = 0
+    for batch in pf.iter_batches(batch_size=batch_size, columns=["item_id", col]):
+        ids = batch.column("item_id").to_numpy(zero_copy_only=False).astype(np.int64)
+        pos = np.minimum(np.searchsorted(sorted_ids, ids), len(sorted_ids) - 1)
+        lists = batch.column(col)
+        hit = (sorted_ids[pos] == ids) & lists.is_valid().to_numpy(zero_copy_only=False)
+        if not hit.any():
+            continue
+        sub = lists.filter(pa.array(hit))
+        emb = sub.flatten().to_numpy(zero_copy_only=False).reshape(len(sub), -1)
+        if out is None:
+            out = np.zeros((N_SPECIAL_TOKENS + len(items), emb.shape[1]), dtype=np.float16)
+        out[sorted_idx[pos[hit]]] = emb
+        n_found += len(sub)
+    if out is None:
         raise ValueError("no vocabulary item has an audio embedding")
-    flat = found[col].explode().to_numpy().astype(np.float32)
-    emb = flat.reshape(found.height, -1)
-    out = np.zeros((N_SPECIAL_TOKENS + len(items), emb.shape[1]), dtype=np.float16)
-    out[found["idx"].to_numpy()] = emb
-    print(f"audio embeddings for {found.height}/{len(items)} vocabulary items")
+    print(f"audio embeddings for {n_found}/{len(items)} vocabulary items")
     cache.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache.with_suffix(".tmp.npy")
     np.save(tmp, out)

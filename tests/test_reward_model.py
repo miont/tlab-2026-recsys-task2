@@ -307,12 +307,16 @@ def test_audio_embeddings(tmp_path):
     cfg = Config(data_root=str(tmp_path))
     cfg.raw_dir.mkdir(parents=True)
     pl.DataFrame(
-        {"item_id": [10, 12, 99], "normalized_embed": [[1.0, 0.0], [0.0, 1.0], [5.0, 5.0]]}
+        {
+            "item_id": [99, 12, 10, 13, 7],
+            "normalized_embed": [[5.0, 5.0], [0.0, 1.0], [1.0, 0.0], None, [3.0, 3.0]],
+        }
     ).write_parquet(cfg.raw_dir / "embeddings.parquet")
     items = pl.DataFrame(
-        {"item_id": [10, 11, 12], "idx": [2, 3, 4]}, schema={"item_id": pl.UInt32, "idx": pl.UInt32}
+        {"item_id": [12, 10, 11, 13], "idx": [4, 2, 3, 5]},
+        schema={"item_id": pl.UInt32, "idx": pl.UInt32},
     )
-    emb = load_audio_embeddings(cfg, items)
-    assert emb.shape == (5, 2) and emb.dtype == np.float16
-    assert emb.tolist() == [[0, 0], [0, 0], [1, 0], [0, 0], [0, 1]]
+    emb = load_audio_embeddings(cfg, items, batch_size=2)  # several batches, one null row
+    assert emb.shape == (6, 2) and emb.dtype == np.float16
+    assert emb.tolist() == [[0, 0], [0, 0], [1, 0], [0, 0], [0, 1], [0, 0]]
     assert (cfg.processed_dir / "audio_embeddings.npy").exists()  # cached
