@@ -91,14 +91,30 @@ class RewardModelConfig:
 
 @dataclass
 class RLConfig:
-    method: str = "rloo"  # rloo | grpo | offpolicy_reinforce | dpo
-    reward: str = "ratio"  # ratio | listen_time | like_ratio | debiased_ratio | ...
-    group_size: int = 16
+    method: str = "rloo"  # rloo | grpo (offpolicy_reinforce | dpo: stage 5)
+    base_run: str = "base"  # policy init and frozen pi_ref: runs/<base_run>/best.pt
+    reward_run: str = "rm_proxy"  # RM that gives the reward: runs/<reward_run>/best.pt
+    gold_run: str | None = "rm_gold"  # evaluation only; null = no gold metrics
+    reward: str = "ratio"  # one of rewards.REWARDS
+    # R5 penalties, added to any reward (0 = off)
+    repeat_penalty: float = 0.0  # candidate already in the context
+    dislike_penalty: float = 0.0  # times p(dislike)
+    uncertainty_penalty: float = 0.0  # times the ensemble std of the ratio head
+    listen_time_cap: int = 600  # seconds, caps the track length in listen_time (R2)
+    group_size: int = 16  # candidates sampled per context
     temperature: float = 1.0
+    top_k: int = 0  # sample from the policy's top-k only (0 = whole vocabulary)
     kl_beta: float = 0.1
-    sft_alpha: float = 0.0
+    sft_alpha: float = 0.0  # weight of the next-item cross-entropy anchor
+    batch_size: int = 64  # contexts per step
     lr: float = 5e-5
+    weight_decay: float = 0.0
+    warmup_steps: int = 100
+    grad_clip: float = 1.0
+    amp: bool = True
     steps: int = 3000
+    eval_every: int = 250
+    keep_checkpoints: bool = False  # also save the policy at every evaluation (step_<N>.pt)
     rollout_len: int = 1
 
 
