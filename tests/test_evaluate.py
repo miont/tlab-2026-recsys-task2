@@ -1,3 +1,4 @@
+import numpy as np
 import polars as pl
 import pytest
 import torch
@@ -105,3 +106,59 @@ def test_recommend_model_and_repeat_filter():
     assert filtered[1][0] not in {10, 12}
     with pytest.raises(ValueError):
         evaluate.recommend_model(model, store, test, idx_to_item, k=2, exclude_seen=True)
+
+
+def make_meta() -> pl.DataFrame:
+    items = make_items().with_columns(mean_ratio=pl.lit(0.5), track_length=pl.lit(200.0))
+    artists = pl.DataFrame({"item_id": [10, 11, 12, 13, 14, 15], "artist_id": [1, 1, 2, 2, 3, 4]})
+    albums = pl.DataFrame({"item_id": [10, 11, 99], "album_id": [7, 8, 9]})
+    return evaluate.item_meta(artists, albums, items)
+
+
+def test_item_meta():
+    meta = make_meta()
+    assert meta["item_id"].to_list() == [10, 11, 12, 13, 14, 15, 99]
+    assert meta["pop_rank"].to_list() == [1, 2, 3, 4, 5, 6, None]
+    assert meta["album_id"].to_list() == [7, 8, None, None, None, None, 9]
+
+
+def test_explain_user_and_profile():
+    store, meta = make_store(), make_meta()
+    torch.manual_seed(0)
+    model = GPT2Recommender(ModelConfig(n_layer=1, n_head=2, n_embd=8), 8, max_seq_len=3)
+    test = evaluate.build_eval_set(store, BOUNDS, "test", seq_len=3, threshold=0.5)
+    idx_to_item = evaluate.idx_to_item_array(make_items())
+    ex = evaluate.explain_user(
+        model, store, test, 0, idx_to_item, meta, k=3, n_history=2, most_pop_days=10
+    )
+    assert ex.uid == 1
+    assert ex.history["item_id"].to_list() == [13, 14]  # the end of the 3-listen context
+    assert ex.history["artist_id"].to_list() == [2, 3]
+    assert ex.recs.group_by("method").len().sort("method")["len"].to_list() == [3, 3, 3]
+    model_recs = ex.recs.filter(method="model")
+    assert model_recs["prob"].is_sorted(descending=True)
+    repeat = ex.recs.filter(method="Repeat")
+    assert repeat["item_id"].to_list() == [14, 13, 11]
+    assert repeat["heard"].to_list() == [1, 1, 2] and repeat["artist_heard"].all()
+    # target 15 (twice) is the only unheard item, by an unheard artist
+    assert ex.targets["item_id"].to_list() == [15, 15]
+    assert ex.targets["heard"].to_list() == [0, 0] and not ex.targets["artist_heard"].any()
+
+    # user 2 heard 10 and 12; its target 11 is unheard
+    filtered = evaluate.explain_user(
+        model, store, test, 1, idx_to_item, meta, k=2, exclude_seen=True, most_pop_days=10
+    )
+    model_recs = filtered.recs.filter(method="model")
+    assert set(model_recs["item_id"].to_list()) <= {11, 13, 14, 15}
+    assert filtered.recs.filter(method="MostPop")["item_id"].to_list() == [11, 13]
+    assert filtered.targets["model_rank"].item() in {1, 2, 3, 4}
+
+    recs = evaluate.recommend_repeat(store, test, k=2, days=10)  # [[14, 13], [12, 10]]
+    profile = evaluate.recs_profile(recs, test, store, meta, k=2)
+    assert profile["heard@2"] == pytest.approx(1.0)
+    assert profile["median_pop_rank@2"] == pytest.approx(3.5)  # ranks 5, 4, 3, 1
+    single = evaluate.recs_profile(np.array([[15, 12]]), test.subset([1]), store, meta, k=2)
+    # user 2 heard 10 and 12: 15 is a new artist, 12 was heard
+    assert single == pytest.approx(
+        {"heard@2": 0.5, "known_artist@2": 0.0, "new_artist@2": 0.5, "median_pop_rank@2": 4.5}
+    )
