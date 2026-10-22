@@ -287,6 +287,25 @@ def item_meta(artists: pl.DataFrame, albums: pl.DataFrame, items: pl.DataFrame) 
     )
 
 
+def item_artists(raw_dir: Path, items: pl.DataFrame) -> np.ndarray | None:
+    """``[n_items]`` artist id by vocabulary index (-1 for specials and tracks without one), or
+    None if ``artist_item_mapping.parquet`` was not downloaded."""
+    path = raw_dir / "artist_item_mapping.parquet"
+    if not path.exists():
+        return None
+    artists = (
+        pl.read_parquet(path)
+        .select(pl.col("item_id").cast(pl.Int64), pl.col("artist_id").cast(pl.Int64))
+        .unique("item_id", keep="first", maintain_order=True)
+    )
+    vocab = items.select("idx", pl.col("item_id").cast(pl.Int64)).join(
+        artists, on="item_id", how="left"
+    )
+    out = np.full(N_SPECIAL_TOKENS + len(items), -1, dtype=np.int64)
+    out[vocab["idx"].to_numpy()] = vocab["artist_id"].fill_null(-1).to_numpy()
+    return out
+
+
 def load_item_meta(raw_dir: Path, items: pl.DataFrame) -> pl.DataFrame:
     """``item_meta`` from the downloaded ``{artist,album}_item_mapping.parquet``."""
     return item_meta(

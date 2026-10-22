@@ -10,11 +10,22 @@ base model ``runs/<rl.base_run>/best.pt``; a frozen copy of it is ``pi_ref``. On
   optionally restricted to the policy's ``top_k``;
 - reward: ``rewards.Reward`` of the proxy RM (``runs/<rl.reward_run>/best.pt``) scoring the
   candidates as recommendations (``is_organic = 0``);
-- advantage: RLOO (reward minus the mean of the other samples of the group) or GRPO (reward
-  standardised within the group);
-- loss: ``-mean(A * log pi_sample(a|s)) + kl_beta * KL(pi_theta || pi_ref) + sft_alpha * CE``,
-  where the KL is exact over the vocabulary and CE is the next-item cross-entropy on the real
-  listen after the context (an optional anchor to the data).
+- objective (``rl.method``), all on the same ``G`` samples and rewards:
+
+  - ``rloo`` / ``grpo``: policy gradient ``-mean(A * log pi_sample(a|s))`` with the RLOO
+    advantage (reward minus the mean of the other samples of the group) or the GRPO one (reward
+    standardised within the group);
+  - ``bon``: Best-of-N fine-tuning, cross-entropy on the sample with the highest reward
+    (the training-time counterpart of reranking the policy's candidates by the RM);
+  - ``dpo``: online DPO (Rafailov et al., 2023; pairs from RM-ranked policy samples as in
+    OneRec): the best sample of the group is chosen, the worst is rejected,
+    ``-log sigmoid(kl_beta * margin)`` of their log-ratios to ``pi_ref``; groups whose samples
+    all get the same reward give no pair;
+
+- loss: objective ``+ kl_beta * KL(pi_theta || pi_ref) + sft_alpha * CE``, where the KL is exact
+  over the vocabulary (not added for ``dpo``, whose ``kl_beta`` is the DPO temperature that
+  already keeps it close to ``pi_ref``) and CE is the next-item cross-entropy on the real listen
+  after the context (an optional anchor to the data).
 
 Dropout is off (the policy stays in eval mode) so that sampling, log-probs and the KL use the
 same distribution.
@@ -22,9 +33,10 @@ same distribution.
 Every ``eval_every`` steps (and at step 0, which is ``pi_ref`` itself) the policy is evaluated
 on the val day with the protocol of ``evaluate``: relevance of the top-100, proxy and gold
 reward of the top-10, behaviour of the top-10 (share of tracks from the history, mean length,
-popularity, coverage, Gini) and the mean KL / entropy over the val contexts. Records go to
-``runs/<run_name>/log.jsonl``; ``last.pt`` holds the full training state (sampling is seeded by
-the step, so a resumed run continues the same way) and ``policy.pt`` the final policy.
+popularity, coverage, Gini, distinct artists) and the mean KL / entropy over the val contexts.
+Records go to ``runs/<run_name>/log.jsonl``; ``last.pt`` holds the full training state
+(sampling is seeded by the step, so a resumed run continues the same way) and ``policy.pt``
+the final policy.
 """
 
 from __future__ import annotations
@@ -50,7 +62,7 @@ from recsys_rl.rewards import Reward, score_recommendations
 from recsys_rl.train import amp_dtype, make_optimizer
 from recsys_rl.utils import get_device, load_checkpoint, save_checkpoint, set_seed
 
-METHODS = ("rloo", "grpo")
+METHODS = ("rloo", "grpo", "bon", "dpo")
 
 
 def sample_contexts(
@@ -83,7 +95,32 @@ def advantages(rewards: torch.Tensor, method: str) -> torch.Tensor:
     if method == "grpo":
         mean, std = rewards.mean(1, keepdim=True), rewards.std(1, keepdim=True)
         return (rewards - mean) / (std + 1e-6)
-    raise ValueError(f"unknown method {method!r}, expected one of {METHODS}")
+    raise ValueError(f"unknown advantage {method!r}, expected rloo or grpo")
+
+
+def dpo_loss(
+    logp: torch.Tensor,
+    ref_logp: torch.Tensor,
+    actions: torch.Tensor,
+    rewards: torch.Tensor,
+    beta: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """DPO loss on the best (chosen) vs worst (rejected) of the ``G`` sampled ``actions`` per
+    context; ``logp`` / ``ref_logp`` are ``[B, n]`` log-probabilities over the actions.
+
+    Contexts whose samples all get the same reward have no preference and are skipped."""
+    rows = torch.arange(len(actions), device=actions.device)
+    chosen = actions[rows, rewards.argmax(1)]
+    rejected = actions[rows, rewards.argmin(1)]
+    pairs = rewards.max(1).values > rewards.min(1).values
+    margin = (logp[rows, chosen] - ref_logp[rows, chosen]) - (
+        logp[rows, rejected] - ref_logp[rows, rejected]
+    )
+    stats = {"pair_share": pairs.float().mean().item()}
+    if not pairs.any():
+        return logp.sum() * 0, stats | {"dpo_margin": 0.0}
+    stats["dpo_margin"] = margin[pairs].mean().item()
+    return -F.logsigmoid(beta * margin[pairs]).mean(), stats
 
 
 def policy_loss(
@@ -117,20 +154,29 @@ def policy_loss(
         probs = rm.score(batch, candidates).float()
         repeat = context_repeat_counts(batch["item_idx"], batch["mask"], candidates)
         r = reward(probs, candidates, repeat)
-        adv = advantages(r, cfg.method)
 
-    pg = -(adv * sample_logp.gather(1, actions)).mean()
     p = logp.exp()
     kl = (p * (logp - ref_logp)).sum(-1).mean()
-    loss = pg + cfg.kl_beta * kl
     stats = {
         "reward": r.mean().item(),
         "reward_std": r.std(1).mean().item(),
-        "pg_loss": pg.item(),
         "kl": kl.item(),
         "entropy": -(p * logp).sum(-1).mean().item(),
         "repeat_share": (repeat > 0).float().mean().item(),
     }
+    if cfg.method in ("rloo", "grpo"):
+        adv = advantages(r, cfg.method)
+        objective = -(adv * sample_logp.gather(1, actions)).mean()
+    elif cfg.method == "bon":
+        best = actions.gather(1, r.argmax(1, keepdim=True))
+        objective = -logp.gather(1, best).mean()
+    elif cfg.method == "dpo":
+        objective, dpo_stats = dpo_loss(logp, ref_logp, actions, r, cfg.kl_beta)
+        stats |= dpo_stats
+    else:
+        raise ValueError(f"unknown method {cfg.method!r}, expected one of {METHODS}")
+    loss = objective if cfg.method == "dpo" else objective + cfg.kl_beta * kl
+    stats["objective"] = objective.item()
     if cfg.sft_alpha:
         valid = next_item >= s
         ce = (
@@ -183,16 +229,21 @@ def behaviour_metrics(
     item_length: np.ndarray,
     item_log_count: np.ndarray,
     n_items: int,
+    item_artist: np.ndarray | None = None,
     k: int = 10,
 ) -> dict[str, float]:
     """Composition of the top-``k`` (vocabulary indices): share of tracks from the user's
-    history, mean track length (s) and log10 train count, Gini of exposure over ``n_items``."""
-    return {
+    history, mean track length (s) and log10 train count, Gini of exposure over ``n_items`` and,
+    if ``item_artist`` is given, the mean number of distinct artists."""
+    out = {
         f"repeat@{k}": metrics.repeat_rate(recs, histories, k),
         f"length@{k}": metrics.mean_item_value(recs, item_length, k),
         f"log_count@{k}": metrics.mean_item_value(recs, item_log_count, k),
         f"gini@{k}": metrics.gini(recs, k, n_items),
     }
+    if item_artist is not None:
+        out[f"artists@{k}"] = metrics.distinct_categories(recs, item_artist, k)
+    return out
 
 
 def load_frozen_rm(cfg: Config, run: str, device: torch.device) -> RewardModel:
@@ -255,6 +306,7 @@ def train_rl(
     item_length[items["idx"].to_numpy()] = items["track_length"].to_numpy()
     item_log_count = np.full(policy.n_items, np.nan)
     item_log_count[items["idx"].to_numpy()] = np.log10(items["count"].to_numpy())
+    item_artist = evaluate.item_artists(cfg.raw_dir, items)  # None if not downloaded
     print(
         f"device {device}, amp {dtype}, {r.method} {r.reward}, beta {r.kl_beta}, "
         f"G {r.group_size}, {r.steps} steps, {val.n_users} val users"
@@ -267,7 +319,7 @@ def train_rl(
         val_metrics = evaluate.evaluate_recs(idx_to_item[recs], val, len(items))
         val_metrics |= {"kl_ref": float(kl.mean()), "entropy": float(ent.mean())}
         val_metrics |= behaviour_metrics(
-            recs, val_histories, item_length, item_log_count, len(items)
+            recs, val_histories, item_length, item_log_count, len(items), item_artist
         )
         for name, model in rms.items():
             scores = score_recommendations(model, reward, store, val, recs[:, :10], amp_dtype=dtype)

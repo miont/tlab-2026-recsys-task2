@@ -91,7 +91,7 @@ class RewardModelConfig:
 
 @dataclass
 class RLConfig:
-    method: str = "rloo"  # rloo | grpo (offpolicy_reinforce | dpo: stage 5)
+    method: str = "rloo"  # rloo | grpo | bon | dpo (see rl.py; offpolicy_reinforce: stage 5)
     base_run: str = "base"  # policy init and frozen pi_ref: runs/<base_run>/best.pt
     reward_run: str = "rm_proxy"  # RM that gives the reward: runs/<reward_run>/best.pt
     gold_run: str | None = "rm_gold"  # evaluation only; null = no gold metrics
@@ -104,7 +104,7 @@ class RLConfig:
     group_size: int = 16  # candidates sampled per context
     temperature: float = 1.0
     top_k: int = 0  # sample from the policy's top-k only (0 = whole vocabulary)
-    kl_beta: float = 0.1
+    kl_beta: float = 0.1  # KL weight; for dpo the DPO temperature beta
     sft_alpha: float = 0.0  # weight of the next-item cross-entropy anchor
     batch_size: int = 64  # contexts per step
     lr: float = 5e-5

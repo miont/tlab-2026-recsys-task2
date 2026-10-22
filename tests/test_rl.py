@@ -7,6 +7,7 @@ import pytest
 import torch
 from test_reward_model import MODEL_CFG, make_cfg, write_events
 
+from recsys_rl import evaluate, metrics
 from recsys_rl.config import RewardModelConfig, RLConfig
 from recsys_rl.data import N_SPECIAL_TOKENS, PAD_IDX, prepare
 from recsys_rl.model import GPT2Recommender, load_model
@@ -21,6 +22,7 @@ from recsys_rl.rewards import (
 from recsys_rl.rl import (
     advantages,
     behaviour_metrics,
+    dpo_loss,
     policy_eval,
     policy_loss,
     sample_contexts,
@@ -143,17 +145,22 @@ def expected_reward(policy, rm, reward, batch):
     return (p * reward(rm.score(batch, cand), cand, repeat)).sum(-1).mean().item()
 
 
-def test_policy_loss_improves_reward_and_kl():
+@pytest.mark.parametrize("method", ["rloo", "grpo", "bon", "dpo"])
+def test_policy_loss_improves_reward_and_kl(method):
     policy, ref, rm = tiny_models()
     reward = make_reward()
     batch = tiny_batch()
     next_item = torch.tensor([9, 1, 10])  # the second one is OOV: no SFT target
-    cfg = RLConfig(group_size=8, kl_beta=0.0, sft_alpha=0.1)
+    # beta is the KL weight, except for dpo where it scales the preference margin
+    cfg = RLConfig(method=method, group_size=8, kl_beta=1.0 if method == "dpo" else 0.0)
+    cfg.sft_alpha = 0.1
     gen = torch.Generator().manual_seed(0)
 
     loss, stats = policy_loss(policy, ref, rm, reward, batch, next_item, cfg, gen)
     assert stats["kl"] == pytest.approx(0.0, abs=1e-6)  # policy == ref at the start
-    assert {"reward", "pg_loss", "entropy", "sft_loss", "repeat_share"} <= set(stats)
+    assert {"reward", "objective", "entropy", "sft_loss", "repeat_share"} <= set(stats)
+    if method == "dpo":
+        assert stats["pair_share"] == 1.0 and stats["dpo_margin"] == pytest.approx(0, abs=1e-6)
     loss.backward()
     assert all(p.grad is None for p in ref.parameters())
     assert all(p.grad is None for p in rm.parameters())
@@ -167,8 +174,13 @@ def test_policy_loss_improves_reward_and_kl():
         opt.step()
     assert expected_reward(policy, rm, reward, batch) > before
     assert stats["kl"] > 0
+    with pytest.raises(ValueError):
+        policy_loss(policy, ref, rm, reward, batch, next_item, RLConfig(method="ppo"), gen)
 
-    # top-k sampling never draws outside the policy's top-k
+
+def test_top_k_sampling():
+    policy, ref, rm = tiny_models()
+    batch = tiny_batch()
     cfg = RLConfig(group_size=64, top_k=2, temperature=0.5)
     logits = policy.next_item_logits(batch)[:, N_SPECIAL_TOKENS:]
     top = logits.topk(2, dim=-1).indices + N_SPECIAL_TOKENS
@@ -179,8 +191,22 @@ def test_policy_loss_improves_reward_and_kl():
         return RewardModel.score(rm, b, candidates)
 
     rm.score = spy
-    policy_loss(policy, ref, rm, reward, batch, next_item, cfg, gen)
+    gen = torch.Generator().manual_seed(0)
+    policy_loss(policy, ref, rm, make_reward(), batch, torch.tensor([9, 9, 9]), cfg, gen)
     assert (drawn[0][:, :, None] == top[:, None, :]).any(-1).all()
+
+
+def test_dpo_loss():
+    logp = torch.log(torch.tensor([[0.5, 0.3, 0.2], [0.2, 0.2, 0.6]]))
+    ref_logp = torch.log(torch.full((2, 3), 1 / 3))
+    actions = torch.tensor([[0, 1, 2], [1, 1, 1]])
+    rewards = torch.tensor([[0.1, 0.9, 0.5], [0.4, 0.4, 0.4]])  # row 2: no preference
+    loss, stats = dpo_loss(logp, ref_logp, actions, rewards, beta=2.0)
+    margin = np.log(0.3) - np.log(0.5)  # chosen = item 1, rejected = item 0; ref terms cancel
+    assert loss.item() == pytest.approx(-np.log(1 / (1 + np.exp(-2 * margin))), rel=1e-5)
+    assert stats == pytest.approx({"pair_share": 0.5, "dpo_margin": margin})
+    loss, stats = dpo_loss(logp, ref_logp, actions, torch.zeros(2, 3), beta=2.0)
+    assert loss.item() == 0 and stats["pair_share"] == 0
 
 
 def test_policy_eval_and_behaviour():
@@ -217,9 +243,11 @@ def test_policy_eval_and_behaviour():
 
     histories = [np.array([2, 3]), np.array([9])]
     length = np.arange(N_ITEMS, dtype=float)
+    artist = np.array([-1, -1, 7, 7, 7, 8, 8, 8, 8, 8, -1, -1])
     out = behaviour_metrics(
-        np.array([[2, 4], [9, 10]]), histories, length, length / 10, N_ITEMS, k=2
+        np.array([[2, 4], [9, 10]]), histories, length, length / 10, N_ITEMS, artist, k=2
     )
+    assert out["artists@2"] == pytest.approx(1.5)  # one artist, then artist 8 + unknown
     assert out["repeat@2"] == pytest.approx(0.5)
     assert out["length@2"] == pytest.approx((2 + 4 + 9 + 10) / 4)
     assert out["log_count@2"] == pytest.approx(0.625)
@@ -235,6 +263,10 @@ def test_train_rl_resume(tmp_path):
         rm_cfg = make_cfg(tmp_path, run_name=name, base_run="base", max_steps=2, eval_every=2)
         rm_cfg.seed = seed
         train_reward_model(rm_cfg, prepared, device)
+    item_ids = np.arange(100, 200)  # the items of write_events
+    pl.DataFrame({"item_id": item_ids, "artist_id": item_ids % 7}).write_parquet(
+        tmp_path / "raw" / "artist_item_mapping.parquet"
+    )
 
     cfg = make_cfg(tmp_path, run_name="rl")
     cfg.rl = RLConfig(
@@ -256,6 +288,7 @@ def test_train_rl_resume(tmp_path):
     expected = {
         "val_ndcg@10", "val_recall@100", "val_proxy_reward@10", "val_gold_reward@10",
         "val_repeat@10", "val_length@10", "val_log_count@10", "val_gini@10", "val_entropy",
+        "val_artists@10",
         "train_reward", "train_kl", "train_sft_loss", "train_grad_norm",
     }  # fmt: skip
     assert expected <= set(log[1])
@@ -271,3 +304,22 @@ def test_train_rl_resume(tmp_path):
     train_rl(cfg, prepared, device)
     log = (cfg.run_dir / "log.jsonl").read_text().splitlines()
     assert [json.loads(r)["step"] for r in log] == [0, 2, 4, 6]
+
+    cfg.run_name, cfg.rl.method, cfg.rl.steps = "rl_dpo", "dpo", 2
+    train_rl(cfg, prepared, device)
+    log = [json.loads(line) for line in (cfg.run_dir / "log.jsonl").read_text().splitlines()]
+    assert {"train_pair_share", "train_dpo_margin", "train_objective"} <= set(log[-1])
+
+
+def test_distinct_categories_and_item_artists(tmp_path):
+    cats = np.array([0, 0, 1, -1, -1])
+    recs = np.array([[0, 1, 2], [3, 4, 0], [1, 0, 3]])
+    # [0, 0, 1] -> 2; two unknown items are distinct -> 3; [0, 0, unknown] -> 2
+    assert metrics.distinct_categories(recs, cats, 3) == pytest.approx(7 / 3)
+    assert metrics.distinct_categories(recs, cats, 2) == pytest.approx((1 + 2 + 1) / 3)
+    assert evaluate.item_artists(tmp_path, pl.DataFrame({"idx": [2], "item_id": [5]})) is None
+    pl.DataFrame({"item_id": [5, 5, 6], "artist_id": [10, 11, 12]}).write_parquet(
+        tmp_path / "artist_item_mapping.parquet"
+    )
+    items = pl.DataFrame({"idx": [2, 3, 4], "item_id": [5, 6, 7]})
+    assert evaluate.item_artists(tmp_path, items).tolist() == [-1, -1, 10, 12, -1]

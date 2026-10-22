@@ -161,6 +161,19 @@ def mean_item_value(recs: np.ndarray, values: np.ndarray, k: int) -> float:
     return float(np.nanmean(np.asarray(values, dtype=np.float64)[_check(recs, k)]))
 
 
+def distinct_categories(recs: np.ndarray, categories: np.ndarray, k: int) -> float:
+    """Mean number of distinct categories (e.g. artists) in a top-K list.
+
+    ``categories`` is indexed by item id; negative entries (unknown category) count as a
+    category of their own per item, so missing metadata never merges items.
+    """
+    top = _check(recs, k)
+    cat = np.asarray(categories)[top].astype(np.int64)
+    cat = np.where(cat >= 0, cat, -1 - top)  # unique pseudo-category per unknown item
+    srt = np.sort(cat, axis=1)
+    return float((1 + (np.diff(srt, axis=1) != 0).sum(1)).mean())
+
+
 def ild(recs: np.ndarray, embeddings: np.ndarray, k: int, batch_size: int = 1024) -> float:
     """Intra-list diversity: mean pairwise cosine distance within a top-K list.
 
