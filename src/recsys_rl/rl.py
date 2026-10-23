@@ -50,6 +50,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -256,6 +257,20 @@ def behaviour_metrics(
     return out
 
 
+def item_features(
+    items: pl.DataFrame, n_items: int, raw_dir: Path
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Inputs of ``behaviour_metrics`` by vocabulary index: track length (s), log10 train count
+    (NaN for specials) and artist (None if ``artist_item_mapping.parquet`` was not
+    downloaded)."""
+    idx = items["idx"].to_numpy()
+    length = np.full(n_items, np.nan)
+    length[idx] = items["track_length"].to_numpy()
+    log_count = np.full(n_items, np.nan)
+    log_count[idx] = np.log10(items["count"].to_numpy())
+    return length, log_count, evaluate.item_artists(raw_dir, items)
+
+
 def load_frozen_rm(cfg: Config, run: str, device: torch.device) -> RewardModel:
     rm = load_reward_model(Path(cfg.data_root) / "runs" / run / "best.pt", device)
     return rm.eval().requires_grad_(False)
@@ -318,11 +333,7 @@ def train_rl(
     val = evaluate.build_eval_set(store, bounds, "val", seq_len, cfg.data.listen_plus_threshold)
     idx_to_item = evaluate.idx_to_item_array(items)
     val_histories = val.histories(store, "item_idx")
-    item_length = np.full(policy.n_items, np.nan)
-    item_length[items["idx"].to_numpy()] = items["track_length"].to_numpy()
-    item_log_count = np.full(policy.n_items, np.nan)
-    item_log_count[items["idx"].to_numpy()] = np.log10(items["count"].to_numpy())
-    item_artist = evaluate.item_artists(cfg.raw_dir, items)  # None if not downloaded
+    item_length, item_log_count, item_artist = item_features(items, policy.n_items, cfg.raw_dir)
     print(
         f"device {device}, amp {dtype}, {r.method} {r.reward}, beta {r.kl_beta}, "
         f"G {r.group_size}, {r.steps} steps, {val.n_users} val users"

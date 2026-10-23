@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 
 import numpy as np
 import polars as pl
@@ -11,6 +12,7 @@ from recsys_rl import evaluate, metrics
 from recsys_rl.config import RewardModelConfig, RLConfig
 from recsys_rl.data import N_SPECIAL_TOKENS, PAD_IDX, prepare
 from recsys_rl.model import GPT2Recommender, load_model
+from recsys_rl.rerank import rerank_eval, tilt
 from recsys_rl.reward_model import HEAD_INDEX, HEADS, RewardModel, train_reward_model
 from recsys_rl.rewards import (
     REWARDS,
@@ -261,7 +263,8 @@ def test_policy_eval_and_behaviour():
     assert out["log_count@2"] == pytest.approx(0.625)
 
 
-def test_train_rl_resume(tmp_path):
+def train_base_and_rms(tmp_path):
+    """Synthetic data, ``base``, ``rm_proxy`` and ``rm_gold`` under ``tmp_path``."""
     write_events(tmp_path / "raw" / "flat" / "50m")
     base_cfg = make_cfg(tmp_path, run_name="base")
     prepared = prepare(base_cfg)
@@ -275,7 +278,11 @@ def test_train_rl_resume(tmp_path):
     pl.DataFrame({"item_id": item_ids, "artist_id": item_ids % 7}).write_parquet(
         tmp_path / "raw" / "artist_item_mapping.parquet"
     )
+    return prepared, device
 
+
+def test_train_rl_resume(tmp_path):
+    prepared, device = train_base_and_rms(tmp_path)
     cfg = make_cfg(tmp_path, run_name="rl")
     cfg.rl = RLConfig(
         batch_size=4,
@@ -341,3 +348,45 @@ def test_distinct_categories_and_item_artists(tmp_path):
     )
     items = pl.DataFrame({"idx": [2, 3, 4], "item_id": [5, 6, 7]})
     assert evaluate.item_artists(tmp_path, items).tolist() == [-1, -1, 10, 12, -1]
+
+
+def test_tilt_matches_full_distribution():
+    torch.manual_seed(0)
+    n, k = 4, 3  # 4 scored candidates, the top-k merges them with the next k items of pi_ref
+    logp_full = torch.log_softmax(torch.randn(5, 12, dtype=torch.float64) * 2, -1)
+    logp = logp_full.sort(1, descending=True).values
+    reward = torch.rand(5, n, dtype=torch.float64)
+    h_out = -(logp[:, n:].exp() * logp[:, n:]).sum(1)
+    for beta in (math.inf, 1.0, 0.1, 0.01):
+        top, kl, entropy = tilt(logp[:, : n + k], reward, h_out, beta, k)
+        # brute force: unscored items get the pi_ref-weighted mean reward of the top-n
+        p_in = logp[:, :n].exp()
+        mean = (p_in * reward).sum(1, keepdim=True) / p_in.sum(1, keepdim=True)
+        full_reward = torch.cat([reward, mean.expand(-1, 12 - n)], 1)
+        tilted = logp + (0 if math.isinf(beta) else full_reward / beta)
+        lq = torch.log_softmax(tilted, -1)
+        assert torch.allclose(kl, (lq.exp() * (lq - logp)).sum(1))
+        assert torch.allclose(entropy, -(lq.exp() * lq).sum(1))
+        assert torch.equal(top, tilted.topk(k, 1).indices)
+    _, kl, _ = tilt(logp[:, : n + k], reward, h_out, math.inf, k)
+    assert torch.allclose(kl, torch.zeros_like(kl))
+    top, kl, _ = tilt(logp[:, : n + k], reward, h_out, 0.0, k)  # greedy: by reward alone
+    assert torch.equal(top, reward.topk(k, 1).indices) and kl.isnan().all()
+
+
+def test_rerank_eval(tmp_path):
+    prepared, device = train_base_and_rms(tmp_path)
+    cfg = make_cfg(tmp_path, run_name="rerank")
+    cfg.rl = RLConfig(amp=False)
+    betas = (math.inf, 0.1, 0.01)  # 50 scored candidates, merged with the rest of the vocabulary
+    table = rerank_eval(cfg, prepared, device, betas=betas, n_candidates=50)
+    assert table["step"].to_list() == [0, 1, 2]
+    assert {"val_ndcg@10", "val_kl_ref", "val_proxy_reward@10", "val_gold_ratio@10"} <= set(
+        table.columns
+    )
+    kl = table["val_kl_ref"].to_list()
+    assert kl[0] == pytest.approx(0.0, abs=1e-9) and kl[0] <= kl[1] <= kl[2]
+    greedy = rerank_eval(cfg, prepared, device, betas=(math.inf, 0.0), split="test")
+    assert np.isnan(greedy["test_kl_ref"][1])
+    proxy = greedy["test_proxy_reward@10"].to_list()
+    assert proxy[1] >= proxy[0]  # the greedy rerank maximises the proxy reward of the top-10
