@@ -24,6 +24,7 @@ store), as the leak rules require.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 import numpy as np
 import polars as pl
@@ -115,6 +116,16 @@ class Reward(nn.Module):
             item_length_bins(items, data_cfg),
             torch.from_numpy(by_bin),
             torch.from_numpy(item_mean_ratio(items, global_mean)),
+        )
+
+    def variant(self, **changes) -> Reward:
+        """The same statistics with ``cfg`` fields replaced, e.g. ``variant(reward="ratio")``."""
+        return Reward(
+            replace(self.cfg, **changes),
+            self.item_length,
+            self.item_length_bin,
+            self.length_bin_ratio,
+            self.item_ratio,
         )
 
     def forward(

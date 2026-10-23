@@ -60,8 +60,13 @@ from recsys_rl.config import Config, RLConfig, save_config
 from recsys_rl.data import N_SPECIAL_TOKENS, EventStore, PreparedData, prepare
 from recsys_rl.evaluate import EvalSet
 from recsys_rl.model import GPT2Recommender, load_model, save_model, to_tensors
-from recsys_rl.reward_model import RewardModel, context_repeat_counts, load_reward_model
-from recsys_rl.rewards import Reward, score_recommendations
+from recsys_rl.reward_model import (
+    HEAD_INDEX,
+    RewardModel,
+    context_repeat_counts,
+    load_reward_model,
+)
+from recsys_rl.rewards import REWARDS, Reward, score_recommendations
 from recsys_rl.train import amp_dtype, make_optimizer
 from recsys_rl.utils import get_device, load_checkpoint, save_checkpoint, set_seed
 
@@ -134,6 +139,22 @@ def dpo_loss(
     return -F.logsigmoid(beta * margin[pairs]).mean(), stats
 
 
+def sample_actions(
+    logits: torch.Tensor, cfg: RLConfig, generator: torch.Generator | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(sample_logp, actions)``: the sampling distribution (``temperature``, ``top_k``) over
+    ``logits`` ``[B, V]`` and ``group_size`` actions per row drawn from it with replacement."""
+    sample_logits = logits / cfg.temperature
+    if cfg.top_k:
+        kth = sample_logits.topk(cfg.top_k, dim=-1).values[:, -1:]
+        sample_logits = sample_logits.masked_fill(sample_logits < kth, float("-inf"))
+    sample_logp = F.log_softmax(sample_logits, -1)
+    actions = torch.multinomial(
+        sample_logp.detach().exp(), cfg.group_size, replacement=True, generator=generator
+    )
+    return sample_logp, actions
+
+
 def policy_loss(
     policy: GPT2Recommender,
     ref: GPT2Recommender,
@@ -152,14 +173,7 @@ def policy_loss(
         ref_logp = F.log_softmax(ref.next_item_logits(batch)[:, s:].float(), -1)
     logp = F.log_softmax(logits, -1)
 
-    sample_logits = logits / cfg.temperature
-    if cfg.top_k:
-        kth = sample_logits.topk(cfg.top_k, dim=-1).values[:, -1:]
-        sample_logits = sample_logits.masked_fill(sample_logits < kth, float("-inf"))
-    sample_logp = F.log_softmax(sample_logits, -1)
-    actions = torch.multinomial(
-        sample_logp.detach().exp(), cfg.group_size, replacement=True, generator=generator
-    )
+    sample_logp, actions = sample_actions(logits, cfg, generator)
     candidates = actions + s
     with torch.no_grad():
         probs = rm.score(batch, candidates).float()
@@ -255,6 +269,67 @@ def behaviour_metrics(
     if item_artist is not None:
         out[f"artists@{k}"] = metrics.distinct_categories(recs, item_artist, k)
     return out
+
+
+@torch.no_grad()
+def reward_scales(
+    cfg: Config,
+    prepared: PreparedData | None = None,
+    device: torch.device | None = None,
+    n_contexts: int = 2048,
+) -> pl.DataFrame:
+    """Scale of every reward variant and R5 penalty term under ``pi_ref``'s own samples.
+
+    Columns ``term``, ``mean``, ``group_std``: the mean over training contexts (as in RL, seeded)
+    of the reward of ``group_size`` samples of ``pi_ref`` and of its std within the group.
+    Terms are the rewards of ``rewards.REWARDS`` without penalties and the penalty inputs
+    ``repeat`` (candidate in the context), ``dislike`` (p(dislike)) and ``uncertainty``
+    (ensemble std of the ratio head). The KL of the regularised optimum depends on the reward
+    only through ``group_std / kl_beta``, so ``kl_beta`` and the penalty weights are set in
+    units of these stds to compare rewards at a similar KL."""
+    r = cfg.rl
+    device = device or get_device()
+    prepared = prepared or prepare(cfg)
+    store, items, bounds = prepared.store.in_memory(), prepared.items, prepared.bounds
+    ref = load_model(Path(cfg.data_root) / "runs" / r.base_run / "best.pt", device).eval()
+    seq_len = ref.backbone.config.n_positions
+    rm = load_frozen_rm(cfg, r.reward_run, device)
+    base = Reward.build(r, items, store, bounds.train_end, cfg.data).to(device)
+    variants = {
+        name: base.variant(
+            reward=name, repeat_penalty=0.0, dislike_penalty=0.0, uncertainty_penalty=0.0
+        )
+        for name in REWARDS
+    }
+    dtype = amp_dtype(device, r.amp)
+    rng = np.random.default_rng([cfg.seed, 1_000_000_007])  # apart from the training steps
+    generator = torch.Generator(device=device).manual_seed(cfg.seed)
+    values: dict[str, list[torch.Tensor]] = {
+        name: [] for name in [*REWARDS, "repeat", "dislike", "uncertainty"]
+    }
+    for b in range(0, n_contexts, r.batch_size):
+        n = min(r.batch_size, n_contexts - b)
+        starts, lengths = sample_contexts(
+            store, prepared.window_starts, prepared.window_lengths, n, rng
+        )
+        batch = to_tensors(store.gather(starts, lengths, seq_len, bounds.train_end), device)
+        with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
+            logits = ref.next_item_logits(batch)[:, N_SPECIAL_TOKENS:].float()
+        candidates = sample_actions(logits, r, generator)[1] + N_SPECIAL_TOKENS
+        with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
+            probs = rm.score(batch, candidates).float()
+        repeat = context_repeat_counts(batch["item_idx"], batch["mask"], candidates)
+        for name, reward in variants.items():
+            values[name].append(reward(probs, candidates, repeat))
+        values["repeat"].append((repeat > 0).float())
+        values["dislike"].append(probs.mean(0)[..., HEAD_INDEX["dislike"]])
+        ratio = probs[..., HEAD_INDEX["ratio"]]
+        values["uncertainty"].append(ratio.std(0) if len(probs) > 1 else torch.zeros_like(ratio[0]))
+    rows = []
+    for name, parts in values.items():
+        v = torch.cat(parts).double()
+        rows.append({"term": name, "mean": v.mean().item(), "group_std": v.std(1).mean().item()})
+    return pl.DataFrame(rows)
 
 
 def item_features(

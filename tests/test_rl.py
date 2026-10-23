@@ -27,6 +27,7 @@ from recsys_rl.rl import (
     dpo_loss,
     policy_eval,
     policy_loss,
+    reward_scales,
     sample_contexts,
     train_rl,
 )
@@ -390,3 +391,22 @@ def test_rerank_eval(tmp_path):
     assert np.isnan(greedy["test_kl_ref"][1])
     proxy = greedy["test_proxy_reward@10"].to_list()
     assert proxy[1] >= proxy[0]  # the greedy rerank maximises the proxy reward of the top-10
+
+
+def test_reward_variant_and_scales(tmp_path):
+    reward = make_reward(reward="ratio", repeat_penalty=1.0)
+    variant = reward.variant(reward="debiased_ratio", repeat_penalty=0.0)
+    assert variant.cfg.reward == "debiased_ratio" and variant.cfg.repeat_penalty == 0
+    assert reward.cfg.reward == "ratio" and reward.cfg.repeat_penalty == 1  # unchanged
+    assert torch.equal(variant.item_length, reward.item_length)
+
+    prepared, device = train_base_and_rms(tmp_path)
+    cfg = make_cfg(tmp_path, run_name="scales")
+    cfg.rl = RLConfig(amp=False, batch_size=8, group_size=4)
+    scales = reward_scales(cfg, prepared, device, n_contexts=20)
+    assert scales["term"].to_list() == [*REWARDS, "repeat", "dislike", "uncertainty"]
+    assert (scales["group_std"] >= 0).all() and scales["group_std"].is_finite().all()
+    assert np.allclose(  # seeded: the same contexts and samples
+        scales["group_std"].to_numpy(),
+        reward_scales(cfg, prepared, device, n_contexts=20)["group_std"].to_numpy(),
+    )
