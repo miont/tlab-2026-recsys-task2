@@ -26,6 +26,7 @@ period targets; ``recs_profile`` aggregates the same tags over all users of an e
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,7 +37,8 @@ import torch
 from recsys_rl import metrics
 from recsys_rl.config import DataConfig
 from recsys_rl.data import DAY_SECONDS, N_SPECIAL_TOKENS, EventStore, PreparedData, SplitBounds
-from recsys_rl.model import GPT2Recommender, to_tensors
+from recsys_rl.model import GPT2Recommender, load_model, to_tensors
+from recsys_rl.utils import get_device
 
 
 @dataclass
@@ -230,34 +232,52 @@ def idx_to_item_array(items: pl.DataFrame) -> np.ndarray:
 def results_table(
     prepared: PreparedData,
     data_cfg: DataConfig,
-    models: dict[str, GPT2Recommender] | None = None,
+    models: Mapping[str, GPT2Recommender | str | Path] | None = None,
     splits: tuple[str, ...] = ("val", "test"),
     most_pop_days: float = 7,
     amp_dtype: torch.dtype | None = None,
+    baselines: bool = True,
+    device: torch.device | None = None,
 ) -> pl.DataFrame:
-    """One row per (split, method, repeat-filter mode): MostPop, Repeat and every model."""
-    store, items = prepared.store, prepared.items
+    """One row per (split, method, repeat-filter mode): MostPop, Repeat (if ``baselines``) and
+    every model.
+
+    A model given as a checkpoint path is loaded to ``device`` only for its own evaluation, so
+    many policies fit on one GPU; eval sets and baselines are built once for all models, from an
+    in-memory copy of the store.
+    """
+    store, items = prepared.store.in_memory(), prepared.items
     idx_to_item = idx_to_item_array(items)
-    rows = []
-    for split in splits:
-        es = build_eval_set(
+    eval_sets = {
+        split: build_eval_set(
             store, prepared.bounds, split, data_cfg.max_seq_len, data_cfg.listen_plus_threshold
         )
-        runs = [
-            ("MostPop", False, recommend_most_pop(store, es, days=most_pop_days)),
-            ("MostPop", True, recommend_most_pop(store, es, days=most_pop_days, exclude_seen=True)),
-            ("Repeat", False, recommend_repeat(store, es, days=most_pop_days)),
-        ]
-        for name, model in (models or {}).items():
+        for split in splits
+    }
+    rows: dict[str, list[dict]] = {split: [] for split in splits}
+
+    def add(split: str, method: str, exclude: bool, recs: np.ndarray) -> None:
+        es = eval_sets[split]
+        row = {"split": split, "method": method, "exclude_seen": exclude, "users": es.n_users}
+        rows[split].append(row | evaluate_recs(recs, es, len(items)))
+
+    if baselines:
+        for split, es in eval_sets.items():
+            add(split, "MostPop", False, recommend_most_pop(store, es, days=most_pop_days))
+            pop_unseen = recommend_most_pop(store, es, days=most_pop_days, exclude_seen=True)
+            add(split, "MostPop", True, pop_unseen)
+            add(split, "Repeat", False, recommend_repeat(store, es, days=most_pop_days))
+    for name, model in (models or {}).items():
+        if not isinstance(model, GPT2Recommender):
+            model = load_model(model, device or get_device())
+        for split, es in eval_sets.items():
             for exclude in (False, True):
                 recs = recommend_model(
                     model, store, es, idx_to_item, exclude_seen=exclude, amp_dtype=amp_dtype
                 )
-                runs.append((name, exclude, recs))
-        for method, exclude, recs in runs:
-            row = {"split": split, "method": method, "exclude_seen": exclude, "users": es.n_users}
-            rows.append(row | evaluate_recs(recs, es, len(items)))
-    return pl.DataFrame(rows)
+                add(split, name, exclude, recs)
+        del model  # a loaded checkpoint is freed before the next one
+    return pl.DataFrame([row for split in splits for row in rows[split]])
 
 
 def item_meta(artists: pl.DataFrame, albums: pl.DataFrame, items: pl.DataFrame) -> pl.DataFrame:

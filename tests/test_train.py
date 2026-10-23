@@ -75,6 +75,14 @@ def test_train_resume_and_results(tmp_path):
     assert table.height == 2 * 5  # (MostPop, Repeat, model) x repeat-filter modes
     assert set(table["method"]) == {"MostPop", "Repeat", "gpt2"}
 
+    only_models = evaluate.results_table(  # a checkpoint path is loaded inside
+        prepared, cfg.data, models={"gpt2": best}, splits=("val",), baselines=False
+    )
+    assert only_models.height == 2
+    assert only_models.drop("method").equals(
+        table.filter(pl.col("method") == "gpt2", pl.col("split") == "val").drop("method")
+    )
+
 
 def test_listen_plus_target_and_early_stopping(tmp_path):
     write_synthetic_events(tmp_path / "raw" / "flat" / "50m")

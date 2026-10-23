@@ -264,11 +264,19 @@ def load_frozen_rm(cfg: Config, run: str, device: torch.device) -> RewardModel:
 def train_rl(
     cfg: Config, prepared: PreparedData | None = None, device: torch.device | None = None
 ) -> Path:
-    """Train (or resume) the RL policy of ``cfg.run_name``; returns ``policy.pt``."""
+    """Train (or resume) the RL policy of ``cfg.run_name``; returns ``policy.pt``. A run whose
+    log already reaches ``rl.steps`` returns at once."""
     r = cfg.rl
     if r.method not in METHODS:
         raise ValueError(f"unknown method {r.method!r}, expected one of {METHODS}")
     run_dir = cfg.run_dir
+    last_path, policy_path = run_dir / "last.pt", run_dir / "policy.pt"
+    log_path = run_dir / "log.jsonl"
+    if policy_path.exists() and log_path.exists():
+        last = json.loads(log_path.read_text().splitlines()[-1])
+        if last["step"] >= r.steps:  # finished: skip loading the models and the data
+            print(f"{cfg.run_name} is done at step {last['step']}")
+            return policy_path
     run_dir.mkdir(parents=True, exist_ok=True)
     save_config(cfg, run_dir / "config.yaml")
     set_seed(cfg.seed)
@@ -298,8 +306,6 @@ def train_rl(
     generator = torch.Generator(device=device)
 
     state = {"step": 0}
-    last_path, policy_path = run_dir / "last.pt", run_dir / "policy.pt"
-    log_path = run_dir / "log.jsonl"
     if last_path.exists():
         ckpt = load_checkpoint(last_path, map_location=device)
         policy.load_state_dict(ckpt["model"])

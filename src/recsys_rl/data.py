@@ -285,10 +285,12 @@ class EventStore:
 
     def in_memory(self) -> EventStore:
         """Copy memmapped columns to RAM (~1.7 GB for 50M): random window reads from a
-        memmap on Google Drive go through FUSE and are slow."""
-        return EventStore(
-            self.uids, self.offsets, {c: np.array(v) for c, v in self.columns.items()}
-        )
+        memmap on Google Drive go through FUSE and are slow. Columns already in RAM are shared,
+        not copied."""
+        columns = {
+            c: np.array(v) if isinstance(v, np.memmap) else v for c, v in self.columns.items()
+        }
+        return EventStore(self.uids, self.offsets, columns)
 
     def cutoff_index(self, cutoff: int) -> np.ndarray:
         """Per user, the first row with ``timestamp >= cutoff`` (absolute row index)."""

@@ -312,6 +312,10 @@ def test_train_rl_resume(tmp_path):
     train_rl(cfg, prepared, device)
     log = (cfg.run_dir / "log.jsonl").read_text().splitlines()
     assert [json.loads(r)["step"] for r in log] == [0, 2, 4, 6]
+    mtime = (cfg.run_dir / "policy.pt").stat().st_mtime_ns
+    assert train_rl(cfg, prepared, device) == cfg.run_dir / "policy.pt"  # done: not reloaded
+    assert (cfg.run_dir / "policy.pt").stat().st_mtime_ns == mtime
+    assert len((cfg.run_dir / "log.jsonl").read_text().splitlines()) == 4
 
     cfg.run_name, cfg.rl.method, cfg.rl.steps = "rl_dpo", "dpo", 2
     train_rl(cfg, prepared, device)
