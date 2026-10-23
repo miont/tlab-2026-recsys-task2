@@ -105,6 +105,7 @@ class RLConfig:
     temperature: float = 1.0
     top_k: int = 0  # sample from the policy's top-k only (0 = whole vocabulary)
     kl_beta: float = 0.1  # KL weight; for dpo the DPO temperature beta
+    grpo_std: str = "group"  # grpo advantage divisor: std of the group | of the whole batch
     sft_alpha: float = 0.0  # weight of the next-item cross-entropy anchor
     batch_size: int = 64  # contexts per step
     lr: float = 5e-5
@@ -114,6 +115,8 @@ class RLConfig:
     amp: bool = True
     steps: int = 3000
     eval_every: int = 250
+    eval_early_every: int = 0  # > 0: evaluate this often up to step eval_early_until
+    eval_early_until: int = 0
     keep_checkpoints: bool = False  # also save the policy at every evaluation (step_<N>.pt)
     rollout_len: int = 1
 

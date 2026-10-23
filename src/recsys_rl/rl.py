@@ -14,7 +14,8 @@ base model ``runs/<rl.base_run>/best.pt``; a frozen copy of it is ``pi_ref``. On
 
   - ``rloo`` / ``grpo``: policy gradient ``-mean(A * log pi_sample(a|s))`` with the RLOO
     advantage (reward minus the mean of the other samples of the group) or the GRPO one (reward
-    standardised within the group);
+    minus the group mean, divided by the std of the group or, with ``grpo_std=batch``, by the
+    std of these centred rewards over the whole batch as in REINFORCE++);
   - ``bon``: Best-of-N fine-tuning, cross-entropy on the sample with the highest reward
     (the training-time counterpart of reranking the policy's candidates by the RM);
   - ``dpo``: online DPO (Rafailov et al., 2023; pairs from RM-ranked policy samples as in
@@ -30,7 +31,8 @@ base model ``runs/<rl.base_run>/best.pt``; a frozen copy of it is ``pi_ref``. On
 Dropout is off (the policy stays in eval mode) so that sampling, log-probs and the KL use the
 same distribution.
 
-Every ``eval_every`` steps (and at step 0, which is ``pi_ref`` itself) the policy is evaluated
+Every ``eval_every`` steps (every ``eval_early_every`` steps up to ``eval_early_until``, and at
+step 0, which is ``pi_ref`` itself) the policy is evaluated
 on the val day with the protocol of ``evaluate``: relevance of the top-100, proxy and gold
 reward of the top-10, behaviour of the top-10 (share of tracks from the history, mean length,
 popularity, coverage, Gini, distinct artists) and the mean KL / entropy over the val contexts.
@@ -85,16 +87,24 @@ def sample_contexts(
     return starts[sel], cuts
 
 
-def advantages(rewards: torch.Tensor, method: str) -> torch.Tensor:
-    """``[B, G]`` advantages of ``G`` samples per context (``G >= 2``)."""
+def advantages(rewards: torch.Tensor, method: str, grpo_std: str = "group") -> torch.Tensor:
+    """``[B, G]`` advantages of ``G`` samples per context (``G >= 2``).
+
+    The GRPO divisor is the std of each group (``grpo_std="group"``) or one std of the centred
+    rewards of the whole batch (``"batch"``): per-group stds make groups of near-equal rewards,
+    where the differences are mostly RM noise, as loud as the informative ones."""
     g = rewards.shape[1]
     if g < 2:
         raise ValueError("group-baseline methods need group_size >= 2")
     if method == "rloo":
         return rewards - (rewards.sum(1, keepdim=True) - rewards) / (g - 1)
     if method == "grpo":
-        mean, std = rewards.mean(1, keepdim=True), rewards.std(1, keepdim=True)
-        return (rewards - mean) / (std + 1e-6)
+        centred = rewards - rewards.mean(1, keepdim=True)
+        if grpo_std == "group":
+            return centred / (rewards.std(1, keepdim=True) + 1e-6)
+        if grpo_std == "batch":
+            return centred / (centred.std() + 1e-6)
+        raise ValueError(f"unknown grpo_std {grpo_std!r}, expected group or batch")
     raise ValueError(f"unknown advantage {method!r}, expected rloo or grpo")
 
 
@@ -165,7 +175,7 @@ def policy_loss(
         "repeat_share": (repeat > 0).float().mean().item(),
     }
     if cfg.method in ("rloo", "grpo"):
-        adv = advantages(r, cfg.method)
+        adv = advantages(r, cfg.method, cfg.grpo_std)
         objective = -(adv * sample_logp.gather(1, actions)).mean()
     elif cfg.method == "bon":
         best = actions.gather(1, r.argmax(1, keepdim=True))
@@ -370,7 +380,9 @@ def train_rl(
         scheduler.step()
         stats.append(step_stats)
         state["step"] += 1
-        if state["step"] % r.eval_every == 0 or state["step"] == r.steps:
+        early = r.eval_early_every > 0 and state["step"] <= r.eval_early_until
+        every = r.eval_early_every if early else r.eval_every
+        if state["step"] % every == 0 or state["step"] == r.steps:
             run_eval({k: float(np.mean([s[k] for s in stats])) for k in stats[0]})
             stats = []
     save_model(policy_path, policy, step=state["step"], rl=asdict(cfg.rl))

@@ -91,6 +91,14 @@ def test_advantages():
     assert rloo[1].abs().max() == 0
     grpo = advantages(r, "grpo")
     assert grpo[0].tolist() == pytest.approx([-1.0, 0.0, 1.0], abs=1e-5)
+    assert grpo[1].abs().max() == 0
+    # one std for the batch: the group of equal rewards does not change the other's scale
+    batch = advantages(r, "grpo", "batch")
+    centred = torch.tensor([-1.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    assert batch[0].tolist() == pytest.approx((centred[:3] / centred.std()).tolist(), abs=1e-5)
+    assert batch[1].abs().max() == 0
+    with pytest.raises(ValueError):
+        advantages(r, "grpo", "global")
     with pytest.raises(ValueError):
         advantages(r[:, :1], "rloo")
     with pytest.raises(ValueError):
@@ -309,6 +317,12 @@ def test_train_rl_resume(tmp_path):
     train_rl(cfg, prepared, device)
     log = [json.loads(line) for line in (cfg.run_dir / "log.jsonl").read_text().splitlines()]
     assert {"train_pair_share", "train_dpo_margin", "train_objective"} <= set(log[-1])
+
+    cfg.run_name, cfg.rl.method, cfg.rl.grpo_std = "rl_early", "grpo", "batch"
+    cfg.rl.steps, cfg.rl.eval_every, cfg.rl.eval_early_every, cfg.rl.eval_early_until = 6, 4, 1, 2
+    train_rl(cfg, prepared, device)
+    log = (cfg.run_dir / "log.jsonl").read_text().splitlines()
+    assert [json.loads(r)["step"] for r in log] == [0, 1, 2, 4, 6]
 
 
 def test_distinct_categories_and_item_artists(tmp_path):
