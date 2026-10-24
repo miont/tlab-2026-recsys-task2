@@ -225,6 +225,31 @@ class RewardModel(nn.Module):
         extra = self._audio(batch["item_idx"]) if self.audio_proj is not None else None
         return self.encoder(batch, extra)
 
+    def candidate_embedding(
+        self,
+        candidates: torch.Tensor,
+        is_organic: torch.Tensor,
+        repeat_count: torch.Tensor,
+        length_bin: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``[*candidates.shape, d]`` representation of the candidates with the features known
+        at recommendation time; ``length_bin`` defaults to the item's own bin."""
+        c = self.encoder.item_emb(candidates)
+        if self.audio_proj is not None:
+            c = c + self._audio(candidates)
+        if length_bin is None:
+            length_bin = self.item_length_bin[candidates]
+        c = c + self.cand_emb["length_bin"](length_bin)
+        c = c + self.cand_emb["is_organic"](is_organic)
+        c = c + self.cand_emb["repeat_bin"](repeat_bins(repeat_count))
+        return self.cand_norm(c)
+
+    def heads_on(self, hidden: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """``[E, *c.shape[:-1], len(HEADS)]`` logits of candidate embeddings ``c``."""
+        h = hidden.expand_as(c)
+        x = torch.cat([h, c, h * c], dim=-1)
+        return torch.stack([head(x) for head in self.heads])
+
     def head_logits(
         self,
         hidden: torch.Tensor,
@@ -235,18 +260,8 @@ class RewardModel(nn.Module):
     ) -> torch.Tensor:
         """``[E, *candidates.shape, len(HEADS)]`` logits; ``hidden`` (``[..., d]``) broadcasts
         against the candidates. ``length_bin`` defaults to the item's own bin."""
-        c = self.encoder.item_emb(candidates)
-        if self.audio_proj is not None:
-            c = c + self._audio(candidates)
-        if length_bin is None:
-            length_bin = self.item_length_bin[candidates]
-        c = c + self.cand_emb["length_bin"](length_bin)
-        c = c + self.cand_emb["is_organic"](is_organic)
-        c = c + self.cand_emb["repeat_bin"](repeat_bins(repeat_count))
-        c = self.cand_norm(c)
-        h = hidden.expand_as(c)
-        x = torch.cat([h, c, h * c], dim=-1)
-        return torch.stack([head(x) for head in self.heads])
+        c = self.candidate_embedding(candidates, is_organic, repeat_count, length_bin)
+        return self.heads_on(hidden, c)
 
     def teacher_forcing(
         self, batch: Mapping[str, torch.Tensor], overrides: Mapping[str, int] | None = None

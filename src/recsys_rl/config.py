@@ -92,8 +92,31 @@ class RewardModelConfig:
 
 
 @dataclass
+class SlateRMConfig:
+    # List-level reward model (slate_rm.py) on runs of consecutive logged recommendations.
+    base_rm: str = "rm_proxy"  # item-level RM it extends: runs/<base_rm>/best.pt
+    slate_size: int = 10  # runs are cut into chunks of at most this many listens
+    min_len: int = 2  # shorter chunks are dropped (no list structure)
+    n_layer: int = 2  # causal transformer over [context state, slate items]
+    n_head: int = 4
+    freeze_rm: bool = True  # train only the list part (the item-level RM stays as it is)
+    user_fraction: float = 1.0  # share of train users whose slates are used (seeded subsample)
+    bootstrap: bool = True  # Poisson(1) weight per (slate, ensemble member)
+    batch_size: int = 256
+    lr: float = 1e-3
+    weight_decay: float = 0.01
+    warmup_steps: int = 200
+    grad_clip: float = 1.0
+    amp: bool = True
+    steps: int = 20_000
+    eval_every: int = 2000
+    patience: int = 3  # evaluations without a val loss improvement
+    max_val_slates: int = 50_000  # val-day slates for early stopping (seeded subset)
+
+
+@dataclass
 class RLConfig:
-    method: str = "rloo"  # rloo|grpo|bon|dpo|distill|exact|slate|offpolicy (see rl.py)
+    method: str = "rloo"  # rloo|grpo|bon|dpo|distill|exact|slate|offpolicy|nextk (see rl.py)
     base_run: str = "base"  # policy init and frozen pi_ref: runs/<base_run>/best.pt
     reward_run: str = "rm_proxy"  # RM that gives the reward: runs/<reward_run>/best.pt
     gold_run: str | None = "rm_gold"  # evaluation only; null = no gold metrics
@@ -110,6 +133,11 @@ class RLConfig:
     # slate: group_size lists of slate_size items sampled without replacement (Plackett-Luce)
     slate_size: int = 10
     slate_diversity: float = 0.0  # reward per distinct artist of the list, per position
+    # nextk (nextk.py): lists generated item by item, reward from a list-level RM
+    nextk_append: bool = True  # condition each position on the earlier ones (False = one softmax)
+    slate_reward_run: str = "slate_rm_proxy"  # list-level RM of the reward
+    slate_gold_run: str | None = "slate_rm_gold"  # list-level RM for evaluation only
+    eval_users: int = 0  # > 0: evaluate nextk on a seeded subset of val users
     # offpolicy (Matveev et al., 2026): REINFORCE on logged recommendations, no RM
     behavior_run: str = "behavior"  # pi_b: runs/<behavior_run>/best.pt (train.target=recommended)
     offpolicy_reward: str = "like_ratio"  # like + ratio / 10 (the paper) | ratio
@@ -145,6 +173,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     rm: RewardModelConfig = field(default_factory=RewardModelConfig)
     rl: RLConfig = field(default_factory=RLConfig)
+    slate_rm: SlateRMConfig = field(default_factory=SlateRMConfig)
 
     @property
     def raw_dir(self) -> Path:

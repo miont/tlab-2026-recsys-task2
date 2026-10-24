@@ -10,6 +10,7 @@ Notebooks are thin entry points for Google Colab; all logic lives in `src/recsys
 | `03_reward_model.ipynb` | 3. Reward model and its evaluation |
 | `04_rl.ipynb` | 4–5. RL fine-tuning, reward / KL sweeps |
 | `05_analysis.ipynb` | 6.1. Multi-step rollouts with simulated feedback; 6.2. Offline validity of long-term proxies, R6 policies |
+| `06_slate_rl.ipynb` | Slate study, level 2: list-level reward model on logged recommendation runs, Next-K generation with RL against it, inference-time list baselines |
 
 Each Colab notebook runs in its own runtime, so every notebook after `00` starts with the same bootstrap cell (mount Drive, clone, install, fix `sys.path`); locally that cell only changes the working directory to the repo root. The bootstrap installs the code from GitHub, so push changes before running a notebook in Colab.
 

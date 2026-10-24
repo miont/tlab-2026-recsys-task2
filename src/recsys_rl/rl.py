@@ -106,7 +106,7 @@ from recsys_rl.rewards import NO_PENALTIES, REWARDS, Reward, score_recommendatio
 from recsys_rl.train import amp_dtype, make_optimizer
 from recsys_rl.utils import get_device, load_checkpoint, save_checkpoint, set_seed
 
-METHODS = ("rloo", "grpo", "bon", "dpo", "distill", "exact", "slate", "offpolicy")
+METHODS = ("rloo", "grpo", "bon", "dpo", "distill", "exact", "slate", "offpolicy", "nextk")
 TARGET_METHODS = ("distill", "exact")  # objectives on the reranker target, without sampling
 
 
@@ -621,6 +621,10 @@ def train_rl(
     r = cfg.rl
     if r.method not in METHODS:
         raise ValueError(f"unknown method {r.method!r}, expected one of {METHODS}")
+    if r.method == "nextk":  # list generation with a list-level RM, see nextk.py
+        from recsys_rl.nextk import train_nextk
+
+        return train_nextk(cfg, prepared, device)
     run_dir = cfg.run_dir
     last_path, policy_path = run_dir / "last.pt", run_dir / "policy.pt"
     log_path = run_dir / "log.jsonl"
