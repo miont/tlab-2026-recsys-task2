@@ -8,8 +8,8 @@ replacement for both methods, and the statistic is the mean per-user difference.
   one row per (method, repeat-filter mode, user): relevance of the top-100 (``ndcg@10``,
   ``recall@100``, ...), and for vocabulary-based methods the KL to ``pi_ref``, the share of
   history tracks, the mean length and log10 train count and the number of distinct artists of
-  the top-10, and the proxy / gold RM view of the top-10
-  (played ``ratio``, length-``debiased`` ratio of R4, ``like``). The RM columns do not depend on
+  the top-10, and the proxy / gold RM view of the top-10 (played ``ratio``,
+  length-``debiased`` ratio of R4, ``like``, ``continue`` of R6). The RM columns do not depend on
   the reward a method was trained or reranked with, so R1 and R4 methods share them.
   Methods: ``pi_ref``, the Repeat baseline (relevance only), RL checkpoints and reranker points
   ``(reward, beta)`` of ``rerank.tilt``. ``exclude_seen`` rows exist for ``pi_ref`` and the RL
@@ -71,6 +71,7 @@ def _top10_profile(
         out[f"{name}_ratio@10"] = scores["ratio"].mean(1)
         out[f"{name}_debiased@10"] = scores["reward"].mean(1)
         out[f"{name}_like@10"] = scores["like"].mean(1)
+        out[f"{name}_continue@10"] = scores["continue"].mean(1)
     return out
 
 

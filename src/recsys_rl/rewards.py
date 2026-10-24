@@ -232,12 +232,18 @@ def score_recommendations(
     amp_dtype: torch.dtype | None = None,
 ) -> Mapping[str, np.ndarray]:
     """RM view of top-K lists ``recs`` (``[n_users, k]`` vocabulary indices) after the frozen
-    contexts of ``eval_set``: ``reward``, ensemble-mean ``ratio`` / ``like`` and ``ratio_std``,
-    each ``[n_users, k]``."""
+    contexts of ``eval_set``: ``reward``, ensemble-mean ``ratio`` / ``like`` / ``continue`` and
+    ``ratio_std``, each ``[n_users, k]``."""
     rm.eval()
     device = next(rm.parameters()).device
     lengths = eval_set.context_ends - eval_set.context_starts
-    out: dict[str, list[np.ndarray]] = {"reward": [], "ratio": [], "like": [], "ratio_std": []}
+    out: dict[str, list[np.ndarray]] = {
+        "reward": [],
+        "ratio": [],
+        "like": [],
+        "continue": [],
+        "ratio_std": [],
+    }
     for b in range(0, eval_set.n_users, batch_size):
         sl = slice(b, b + batch_size)
         batch = to_tensors(
@@ -253,6 +259,7 @@ def score_recommendations(
             "reward": reward(probs, cand, repeat),
             "ratio": ratio.mean(0),
             "like": probs[..., HEAD_INDEX["like"]].mean(0),
+            "continue": probs[..., HEAD_INDEX["continue"]].mean(0),
             "ratio_std": ratio.std(0) if len(probs) > 1 else torch.zeros_like(ratio[0]),
         }
         for name, value in values.items():
