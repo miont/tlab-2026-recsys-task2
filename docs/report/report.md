@@ -593,7 +593,7 @@ REINFORCE с многошаговой коррекцией (Matveev et al., 2026
 5. Shao Z. et al. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. arXiv:2402.03300, 2024.
 6. Rafailov R. et al. Direct Preference Optimization: Your Language Model is Secretly a Reward Model. NeurIPS, 2023.
 7. Petrov A. V., Macdonald C. Aligning GPTRec with Beyond-Accuracy Goals with Reinforcement Learning. arXiv:2403.04875, 2024.
-8. Matveev et al. Session-Level Optimization for Large-Scale Retrieval using REINFORCE with Multi-Step Off-Policy Correction. arXiv:2607.02818, 2026.
+8. Matveev A. et al. Session-Level Optimization for Large-Scale Retrieval using REINFORCE with Multi-Step Off-Policy Correction. arXiv:2607.02818, 2026.
 9. Efron B., Tibshirani R. J. An Introduction to the Bootstrap. Chapman & Hall, 1993.
 10. Holm S. A Simple Sequentially Rejective Multiple Test Procedure. Scandinavian Journal of Statistics, 6(2), 1979.
 11. Yi X. et al. Sampling-Bias-Corrected Neural Modeling for Large Corpus Item Recommendations. RecSys, 2019.
