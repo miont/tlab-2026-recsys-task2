@@ -8,6 +8,7 @@ from test_rl import train_base_and_rms
 
 from recsys_rl import evaluate, metrics
 from recsys_rl.config import RLConfig
+from recsys_rl.data import N_SPECIAL_TOKENS
 from recsys_rl.significance import bootstrap_table, collect_per_user
 
 
@@ -73,13 +74,22 @@ def test_collect_per_user(tmp_path):
             "rr_inf": ("ratio", math.inf),
             "rr_0.1": ("ratio", 0.1),
             "r4_0.1": ("debiased_ratio", 0.1),
+            "art_0.1": ({"reward": "ratio", "artist_penalty": 1.0}, 0.1),
         },
         n_candidates=30,
         k=20,
         exclude_seen=False,  # every synthetic user has heard every item
     )
     methods = per_user.filter(~pl.col("exclude_seen"))["method"].unique(maintain_order=True)
-    assert methods.to_list() == ["Repeat", "pi_ref", "copy", "rr_inf", "rr_0.1", "r4_0.1"]
+    assert methods.to_list() == [
+        "Repeat",
+        "pi_ref",
+        "copy",
+        "rr_inf",
+        "rr_0.1",
+        "r4_0.1",
+        "art_0.1",
+    ]
     assert not per_user["exclude_seen"].any()
     means = per_user.group_by("method", "exclude_seen").agg(pl.exclude(["split", "user"]).mean())
 
@@ -100,6 +110,13 @@ def test_collect_per_user(tmp_path):
     for column in ("ndcg@10", "recall@20", "gold_ratio@10", "proxy_debiased@10"):
         assert mean("rr_inf", column) == pytest.approx(mean("pi_ref", column))
     assert mean("pi_ref", "kl_ref") == pytest.approx(0, abs=1e-6)
+    artist = evaluate.item_artists(cfg.raw_dir, prepared.items)
+    idx_to_item = evaluate.idx_to_item_array(prepared.items)
+    item_idx = {int(v): i for i, v in enumerate(idx_to_item) if i >= N_SPECIAL_TOKENS}
+    recs_idx = np.vectorize(item_idx.get)(recs[:, :10])
+    assert mean("pi_ref", "artists@10") == pytest.approx(
+        metrics.distinct_categories(recs_idx, artist, 10)
+    )
     assert mean("rr_0.1", "kl_ref") > 0
     assert mean("rr_0.1", "proxy_ratio@10") >= mean("pi_ref", "proxy_ratio@10")
     assert mean("Repeat", "repeat@10") is None  # relevance only

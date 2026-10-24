@@ -76,7 +76,7 @@ from recsys_rl.reward_model import (
     context_repeat_counts,
     load_reward_model,
 )
-from recsys_rl.rewards import REWARDS, Reward, score_recommendations
+from recsys_rl.rewards import NO_PENALTIES, REWARDS, Reward, score_recommendations
 from recsys_rl.train import amp_dtype, make_optimizer
 from recsys_rl.utils import get_device, load_checkpoint, save_checkpoint, set_seed
 
@@ -205,7 +205,9 @@ def policy_loss(
     with torch.no_grad():
         probs = rm.score(batch, candidates).float()
         repeat = context_repeat_counts(batch["item_idx"], batch["mask"], candidates)
-        r = reward(probs, candidates, repeat)
+        # the reranker target weighs the artist share of the top-N by pi_ref, as in rerank
+        weights = ref_logp.exp().gather(1, actions) if cfg.method in TARGET_METHODS else None
+        r = reward(probs, candidates, repeat, weights)
 
     p = logp.exp()
     kl = (p * (logp - ref_logp)).sum(-1).mean()
@@ -325,8 +327,10 @@ def reward_scales(
     Columns ``term``, ``mean``, ``group_std``: the mean over training contexts (as in RL, seeded)
     of the reward of ``group_size`` samples of ``pi_ref`` and of its std within the group.
     Terms are the rewards of ``rewards.REWARDS`` without penalties and the penalty inputs
-    ``repeat`` (candidate in the context), ``dislike`` (p(dislike)) and ``uncertainty``
-    (ensemble std of the ratio head). The KL of the regularised optimum depends on the reward
+    ``repeat`` (candidate in the context), ``dislike`` (p(dislike)), ``uncertainty``
+    (ensemble std of the ratio head), ``popularity`` (log10 train listens) and, if the artist
+    mapping is downloaded, ``artist`` (share of the other samples of the group with the same
+    artist). The KL of the regularised optimum depends on the reward
     only through ``group_std / kl_beta``, so ``kl_beta`` and the penalty weights are set in
     units of these stds to compare rewards at a similar KL."""
     r = cfg.rl
@@ -336,19 +340,15 @@ def reward_scales(
     ref = load_model(Path(cfg.data_root) / "runs" / r.base_run / "best.pt", device).eval()
     seq_len = ref.backbone.config.n_positions
     rm = load_frozen_rm(cfg, r.reward_run, device)
-    base = Reward.build(r, items, store, bounds.train_end, cfg.data).to(device)
-    variants = {
-        name: base.variant(
-            reward=name, repeat_penalty=0.0, dislike_penalty=0.0, uncertainty_penalty=0.0
-        )
-        for name in REWARDS
-    }
+    base = Reward.build(r, items, store, bounds.train_end, cfg.data, cfg.raw_dir).to(device)
+    variants = {name: base.variant(reward=name, **NO_PENALTIES) for name in REWARDS}
+    penalty_terms = ["repeat", "dislike", "uncertainty", "popularity"]
+    if base.item_artist is not None:
+        penalty_terms.append("artist")
     dtype = amp_dtype(device, r.amp)
     rng = np.random.default_rng([cfg.seed, 1_000_000_007])  # apart from the training steps
     generator = torch.Generator(device=device).manual_seed(cfg.seed)
-    values: dict[str, list[torch.Tensor]] = {
-        name: [] for name in [*REWARDS, "repeat", "dislike", "uncertainty"]
-    }
+    values: dict[str, list[torch.Tensor]] = {name: [] for name in [*REWARDS, *penalty_terms]}
     for b in range(0, n_contexts, r.batch_size):
         n = min(r.batch_size, n_contexts - b)
         starts, lengths = sample_contexts(
@@ -367,6 +367,9 @@ def reward_scales(
         values["dislike"].append(probs.mean(0)[..., HEAD_INDEX["dislike"]])
         ratio = probs[..., HEAD_INDEX["ratio"]]
         values["uncertainty"].append(ratio.std(0) if len(probs) > 1 else torch.zeros_like(ratio[0]))
+        values["popularity"].append(base.item_log_count[candidates])
+        if "artist" in values:
+            values["artist"].append(base.artist_share(candidates))
     rows = []
     for name, parts in values.items():
         v = torch.cat(parts).double()
@@ -427,7 +430,7 @@ def train_rl(
     for name, model in rms.items():
         if model.max_seq_len != seq_len or model.encoder.n_items != policy.n_items:
             raise ValueError(f"{name} RM does not match the base model (vocabulary / seq len)")
-    reward = Reward.build(r, items, store, bounds.train_end, cfg.data).to(device)
+    reward = Reward.build(r, items, store, bounds.train_end, cfg.data, cfg.raw_dir).to(device)
 
     optimizer = make_optimizer(policy, r.lr, r.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(

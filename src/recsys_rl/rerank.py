@@ -79,8 +79,9 @@ def candidate_scores(
         cand = top.indices[:, :n_candidates] + N_SPECIAL_TOKENS
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             probs = rm.score(batch, cand).float()
-        r = reward(probs, cand, context_repeat_counts(batch["item_idx"], batch["mask"], cand))
         top_in = top.values[:, :n_candidates]
+        repeat = context_repeat_counts(batch["item_idx"], batch["mask"], cand)
+        r = reward(probs, cand, repeat, weights=top_in.exp())  # artist share by pi_ref mass
         h_all = -(logp.exp() * logp).sum(1)
         h_in = -(top_in.exp() * top_in).sum(1)
         out["logp"].append(top.values.double().cpu())
@@ -138,7 +139,7 @@ def rerank_eval(
     rms = {"proxy": load_frozen_rm(cfg, r.reward_run, device)}
     if r.gold_run:
         rms["gold"] = load_frozen_rm(cfg, r.gold_run, device)
-    reward = Reward.build(r, items, store, bounds.train_end, cfg.data).to(device)
+    reward = Reward.build(r, items, store, bounds.train_end, cfg.data, cfg.raw_dir).to(device)
     dtype = amp_dtype(device, r.amp)
     if 0 in betas and n_candidates < k:
         raise ValueError(f"the greedy rerank (beta = 0) needs n_candidates >= k = {k}")

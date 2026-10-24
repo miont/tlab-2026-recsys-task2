@@ -37,14 +37,44 @@ from recsys_rl.train import train
 N_ITEMS = 12  # vocabulary incl. the 2 special tokens
 
 
-def make_reward(**cfg) -> Reward:
+def make_reward(item_log_count=None, item_artist=None, **cfg) -> Reward:
     return Reward(
         RLConfig(**cfg),
         item_length=torch.arange(N_ITEMS, dtype=torch.float) * 60,  # item i lasts i minutes
         item_length_bin=torch.arange(N_ITEMS) % 3,
         length_bin_ratio=torch.tensor([0.5, 0.6, 0.7]),
         item_ratio=torch.full((N_ITEMS,), 0.4),
+        item_log_count=item_log_count,
+        item_artist=item_artist,
     )
+
+
+def test_popularity_and_artist_penalties():
+    log_count = torch.arange(N_ITEMS, dtype=torch.float) / 10
+    artist = torch.tensor([-1, -1, 0, 0, 1, -1, 2, 2, 2, 3, 3, 3])  # by vocabulary index
+    stats = {"item_log_count": log_count, "item_artist": artist}
+    cand = torch.tensor([[2, 3, 4, 5], [6, 7, 8, 8]])  # artists [0, 0, 1, ?] and [2, 2, 2, 2]
+    reward = make_reward(artist_penalty=1.0, **stats)
+    share = reward.artist_share(cand)
+    assert torch.allclose(share[0], torch.tensor([1 / 3, 1 / 3, 0, 0]))  # unknown shares nothing
+    assert torch.allclose(share[1], torch.ones(4))  # a repeated sample counts as the same artist
+    w = torch.tensor([[0.5, 0.1, 0.2, 0.2], [0.25, 0.25, 0.25, 0.25]])
+    weighted = reward.artist_share(cand, w)
+    assert weighted[0, 0].item() == pytest.approx(0.1 / 0.5)  # others' weight 0.5
+    assert weighted[0, 1].item() == pytest.approx(0.5 / 0.9)
+
+    probs = torch.zeros(1, 2, 4, len(HEADS))
+    probs[..., HEAD_INDEX["ratio"]] = 0.5
+    repeat = torch.zeros_like(cand)
+    base = make_reward(**stats)(probs, cand, repeat)
+    assert torch.allclose(reward(probs, cand, repeat), base - share)
+    assert torch.allclose(reward(probs, cand, repeat, w), base - weighted)
+    pop = make_reward(popularity_penalty=0.5, **stats)(probs, cand, repeat)
+    assert torch.allclose(pop, base - 0.5 * log_count[cand])
+    with pytest.raises(ValueError):
+        make_reward(artist_penalty=1.0)  # no artist mapping
+    with pytest.raises(ValueError):
+        make_reward(popularity_penalty=1.0)
 
 
 def test_rewards():
@@ -436,6 +466,10 @@ def test_rerank_eval(tmp_path):
     )
     kl = table["val_kl_ref"].to_list()
     assert kl[0] == pytest.approx(0.0, abs=1e-9) and kl[0] <= kl[1] <= kl[2]
+    cfg.rl = RLConfig(amp=False, artist_penalty=0.5, popularity_penalty=0.1)
+    penalised = rerank_eval(cfg, prepared, device, betas=(0.1,), n_candidates=50)
+    assert np.isfinite(penalised["val_kl_ref"][0]) and penalised["val_artists@10"][0] > 0
+    cfg.rl = RLConfig(amp=False)
     greedy = rerank_eval(cfg, prepared, device, betas=(math.inf, 0.0), split="test")
     assert np.isnan(greedy["test_kl_ref"][1])
     proxy = greedy["test_proxy_reward@10"].to_list()
@@ -453,7 +487,8 @@ def test_reward_variant_and_scales(tmp_path):
     cfg = make_cfg(tmp_path, run_name="scales")
     cfg.rl = RLConfig(amp=False, batch_size=8, group_size=4)
     scales = reward_scales(cfg, prepared, device, n_contexts=20)
-    assert scales["term"].to_list() == [*REWARDS, "repeat", "dislike", "uncertainty"]
+    terms = [*REWARDS, "repeat", "dislike", "uncertainty", "popularity", "artist"]
+    assert scales["term"].to_list() == terms
     assert (scales["group_std"] >= 0).all() and scales["group_std"].is_finite().all()
     assert np.allclose(  # seeded: the same contexts and samples
         scales["group_std"].to_numpy(),

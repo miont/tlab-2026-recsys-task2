@@ -100,6 +100,8 @@ class RLConfig:
     repeat_penalty: float = 0.0  # candidate already in the context
     dislike_penalty: float = 0.0  # times p(dislike)
     uncertainty_penalty: float = 0.0  # times the ensemble std of the ratio head
+    popularity_penalty: float = 0.0  # times log10 of the track's train listens
+    artist_penalty: float = 0.0  # times the share of the other candidates with the same artist
     listen_time_cap: int = 600  # seconds, caps the track length in listen_time (R2)
     group_size: int = 16  # candidates sampled per context
     distill_candidates: int = 100  # distill / exact: top-N of pi_ref scored for the target

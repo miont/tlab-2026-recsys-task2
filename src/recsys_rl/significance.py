@@ -7,7 +7,8 @@ replacement for both methods, and the statistic is the mean per-user difference.
 - ``collect_per_user`` evaluates every method on the frozen contexts of one split and returns
   one row per (method, repeat-filter mode, user): relevance of the top-100 (``ndcg@10``,
   ``recall@100``, ...), and for vocabulary-based methods the KL to ``pi_ref``, the share of
-  history tracks and the mean length of the top-10, and the proxy / gold RM view of the top-10
+  history tracks, the mean length and log10 train count and the number of distinct artists of
+  the top-10, and the proxy / gold RM view of the top-10
   (played ``ratio``, length-``debiased`` ratio of R4, ``like``). The RM columns do not depend on
   the reward a method was trained or reranked with, so R1 and R4 methods share them.
   Methods: ``pi_ref``, the Repeat baseline (relevance only), RL checkpoints and reranker points
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -34,7 +36,7 @@ from recsys_rl.evaluate import EvalSet
 from recsys_rl.model import load_model
 from recsys_rl.rerank import candidate_scores, tilt
 from recsys_rl.reward_model import RewardModel
-from recsys_rl.rewards import Reward, score_recommendations
+from recsys_rl.rewards import NO_PENALTIES, Reward, score_recommendations
 from recsys_rl.rl import item_features, load_frozen_rm, policy_eval
 from recsys_rl.train import amp_dtype
 from recsys_rl.utils import get_device
@@ -46,6 +48,8 @@ def _top10_profile(
     recs: np.ndarray,
     histories: list[np.ndarray],
     item_length: np.ndarray,
+    item_log_count: np.ndarray,
+    item_artist: np.ndarray | None,
     rms: Mapping[str, RewardModel],
     reward: Reward,
     store: EventStore,
@@ -57,7 +61,11 @@ def _top10_profile(
     out = {
         "repeat@10": np.array([np.isin(r, h).mean() for r, h in zip(top, histories, strict=True)]),
         "length@10": np.nanmean(item_length[top], axis=1),
+        "log_count@10": np.nanmean(item_log_count[top], axis=1),
     }
+    if item_artist is not None:
+        cat = np.where(item_artist[top] >= 0, item_artist[top], -1 - top)  # as distinct_categories
+        out["artists@10"] = 1.0 + (np.diff(np.sort(cat, axis=1), axis=1) != 0).sum(1)
     for name, rm in rms.items():
         scores = score_recommendations(rm, reward, store, eval_set, top, amp_dtype=dtype)
         out[f"{name}_ratio@10"] = scores["ratio"].mean(1)
@@ -72,13 +80,14 @@ def collect_per_user(
     device: torch.device | None = None,
     split: str = "val",
     policies: Mapping[str, str | Path] | None = None,
-    rerank: Mapping[str, tuple[str, float]] | None = None,
+    rerank: Mapping[str, tuple[str | Mapping[str, Any], float]] | None = None,
     n_candidates: int = 100,
     k: int = 100,
     exclude_seen: bool = True,
 ) -> pl.DataFrame:
     """Per-user metrics of ``pi_ref`` (``runs/<rl.base_run>/best.pt``), Repeat, the
-    ``policies`` (name -> checkpoint) and the ``rerank`` points (name -> (reward, beta)), scored
+    ``policies`` (name -> checkpoint) and the ``rerank`` points (name -> (reward, beta), where
+    the reward is a name or a dict of ``Reward.variant`` changes such as R5 penalties), scored
     by the proxy / gold RMs of ``cfg.rl``; see the module docstring. Relevance is at 10 and
     ``k``; ``exclude_seen = False`` skips the repeat-filter rows."""
     r = cfg.rl
@@ -90,14 +99,14 @@ def collect_per_user(
     rms = {"proxy": load_frozen_rm(cfg, r.reward_run, device)}
     if r.gold_run:
         rms["gold"] = load_frozen_rm(cfg, r.gold_run, device)
-    reward = Reward.build(r, items, store, bounds.train_end, cfg.data).to(device)
-    profile_reward = reward.variant(reward="debiased_ratio")
+    reward = Reward.build(r, items, store, bounds.train_end, cfg.data, cfg.raw_dir).to(device)
+    profile_reward = reward.variant(reward="debiased_ratio", **NO_PENALTIES)
     dtype = amp_dtype(device, r.amp)
 
     es = evaluate.build_eval_set(store, bounds, split, seq_len, cfg.data.listen_plus_threshold)
     idx_to_item = evaluate.idx_to_item_array(items)
     histories = es.histories(store, "item_idx")
-    item_length = item_features(items, ref.n_items, cfg.raw_dir)[0]
+    item_length, item_log_count, item_artist = item_features(items, ref.n_items, cfg.raw_dir)
     frames = []
 
     def add(method: str, exclude: bool, raw_recs: np.ndarray, **extra: np.ndarray) -> None:
@@ -107,8 +116,9 @@ def collect_per_user(
 
     def add_vocab(method: str, recs: np.ndarray, kl: np.ndarray) -> None:
         profile = _top10_profile(
-            recs, histories, item_length, rms, profile_reward, store, es, dtype
-        )
+            recs, histories, item_length, item_log_count, item_artist, rms, profile_reward,
+            store, es, dtype,
+        )  # fmt: skip
         add(method, False, idx_to_item[recs], kl_ref=kl, **profile)
 
     def add_unseen(method: str, model) -> None:
@@ -129,12 +139,13 @@ def collect_per_user(
         add_vocab(name, recs, kl)
         add_unseen(name, policy)
         del policy
-    by_reward: dict[str, list[tuple[str, float]]] = {}
-    for name, (reward_name, beta) in (rerank or {}).items():
-        by_reward.setdefault(reward_name, []).append((name, beta))
-    for reward_name, points in by_reward.items():  # the RM scores the candidates once per reward
+    by_reward: dict[tuple, list[tuple[str, float]]] = {}
+    for name, (spec, beta) in (rerank or {}).items():
+        changes = {"reward": spec} if isinstance(spec, str) else dict(spec)
+        by_reward.setdefault(tuple(sorted(changes.items())), []).append((name, beta))
+    for changes, points in by_reward.items():  # the RM scores the candidates once per reward
         cands = candidate_scores(
-            ref, rms["proxy"], reward.variant(reward=reward_name), store, es, n_candidates, k,
+            ref, rms["proxy"], reward.variant(**dict(changes)), store, es, n_candidates, k,
             amp_dtype=dtype,
         )  # fmt: skip
         for name, beta in points:
