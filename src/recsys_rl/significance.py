@@ -7,16 +7,18 @@ replacement for both methods, and the statistic is the mean per-user difference.
 - ``collect_per_user`` evaluates every method on the frozen contexts of one split and returns
   one row per (method, repeat-filter mode, user): relevance of the top-100 (``ndcg@10``,
   ``recall@100``, ...), and for vocabulary-based methods the KL to ``pi_ref``, the share of
-  history tracks, the mean length and log10 train count and the number of distinct artists of
-  the top-10, and the proxy / gold RM view of the top-10 (played ``ratio``,
-  length-``debiased`` ratio of R4, ``like``, ``continue`` of R6). The RM columns do not depend on
-  the reward a method was trained or reranked with, so R1 and R4 methods share them.
+  history tracks, the mean length and log10 train count, ``npcount@10`` (mean train count over
+  that of the 10 most popular tracks: nPCOUNT of Petrov & Macdonald, 2024, 1 = MostPop) and the
+  number of distinct artists of the top-10, and the proxy / gold RM view of the top-10 (played
+  ``ratio``, length-``debiased`` ratio of R4, ``like``, ``continue`` of R6). The RM columns do
+  not depend on the reward a method was trained or reranked with, so R1 and R4 methods share
+  them.
   Methods: ``pi_ref``, the Repeat baseline (relevance only), RL checkpoints and reranker points
   ``(reward, beta)`` of ``rerank.tilt``. ``exclude_seen`` rows exist for ``pi_ref`` and the RL
   checkpoints (relevance only; the reranker has no repeat-filter mode).
 - ``bootstrap_table`` compares (method, baseline) pairs on every metric with the same bootstrap
-  resamples, per split and repeat-filter mode: means, difference, percentile CI and a
-  two-sided bootstrap p-value.
+  resamples, per split and repeat-filter mode: means, difference, percentile CI, a two-sided
+  bootstrap p-value and its Holm adjustment over the pairs of the call for each metric.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ def _top10_profile(
     item_length: np.ndarray,
     item_log_count: np.ndarray,
     item_artist: np.ndarray | None,
+    max_pcount: float,
     rms: Mapping[str, RewardModel],
     reward: Reward,
     store: EventStore,
@@ -62,6 +65,7 @@ def _top10_profile(
         "repeat@10": np.array([np.isin(r, h).mean() for r, h in zip(top, histories, strict=True)]),
         "length@10": np.nanmean(item_length[top], axis=1),
         "log_count@10": np.nanmean(item_log_count[top], axis=1),
+        "npcount@10": np.nanmean(10 ** item_log_count[top], axis=1) / max_pcount,
     }
     if item_artist is not None:
         cat = np.where(item_artist[top] >= 0, item_artist[top], -1 - top)  # as distinct_categories
@@ -108,6 +112,7 @@ def collect_per_user(
     idx_to_item = evaluate.idx_to_item_array(items)
     histories = es.histories(store, "item_idx")
     item_length, item_log_count, item_artist = item_features(items, ref.n_items, cfg.raw_dir)
+    max_pcount = float(np.sort(items["count"].to_numpy())[-10:].mean())  # MostPop by train count
     frames = []
 
     def add(method: str, exclude: bool, raw_recs: np.ndarray, **extra: np.ndarray) -> None:
@@ -117,8 +122,8 @@ def collect_per_user(
 
     def add_vocab(method: str, recs: np.ndarray, kl: np.ndarray) -> None:
         profile = _top10_profile(
-            recs, histories, item_length, item_log_count, item_artist, rms, profile_reward,
-            store, es, dtype,
+            recs, histories, item_length, item_log_count, item_artist, max_pcount, rms,
+            profile_reward, store, es, dtype,
         )  # fmt: skip
         add(method, False, idx_to_item[recs], kl_ref=kl, **profile)
 
@@ -170,6 +175,17 @@ def _bootstrap_means(
     return np.concatenate(out, axis=1)
 
 
+def holm(p_values: np.ndarray) -> np.ndarray:
+    """Holm-Bonferroni adjusted p-values (family-wise error control, uniformly more powerful
+    than Bonferroni): the i-th smallest p times ``n - i``, made monotone and capped at 1."""
+    p = np.asarray(p_values, dtype=np.float64)
+    order = np.argsort(p)
+    adjusted = np.maximum.accumulate(p[order] * (len(p) - np.arange(len(p))))
+    out = np.empty_like(p)
+    out[order] = np.minimum(adjusted, 1.0)
+    return out
+
+
 def bootstrap_table(
     per_user: pl.DataFrame,
     pairs: Sequence[tuple[str, str]],
@@ -181,7 +197,9 @@ def bootstrap_table(
     """One row per (split, repeat-filter mode, pair, metric) where both methods have the metric
     for every user: ``value`` and ``baseline_value`` (means), ``diff``, ``rel_diff``
     (diff / baseline), the ``1 - alpha`` percentile CI of the diff and the two-sided bootstrap
-    p-value ``2 * min(P(d* <= 0), P(d* >= 0))`` with the +1 correction (so never 0)."""
+    p-value ``2 * min(P(d* <= 0), P(d* >= 0))`` with the +1 correction (so never 0), and
+    ``p_holm``: the Holm adjustment of ``p_value`` over all pairs of this call with the same
+    split, repeat-filter mode and metric (the family depends on the pairs passed)."""
     names = metric_names or [c for c in per_user.columns if c not in KEYS]
     rows = []
     for (split, exclude), group in per_user.group_by(
@@ -227,4 +245,11 @@ def bootstrap_table(
                     "p_value": p[i],
                 }
             )
+    families: dict[tuple, list[int]] = {}
+    for i, row in enumerate(rows):
+        families.setdefault((row["split"], row["exclude_seen"], row["metric"]), []).append(i)
+    for members in families.values():
+        adjusted = holm(np.array([rows[i]["p_value"] for i in members]))
+        for i, value in zip(members, adjusted, strict=True):
+            rows[i]["p_holm"] = float(value)
     return pl.DataFrame(rows)

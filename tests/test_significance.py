@@ -9,7 +9,7 @@ from test_rl import train_base_and_rms
 from recsys_rl import evaluate, metrics
 from recsys_rl.config import RLConfig
 from recsys_rl.data import N_SPECIAL_TOKENS
-from recsys_rl.significance import bootstrap_table, collect_per_user
+from recsys_rl.significance import bootstrap_table, collect_per_user, holm
 
 
 def test_relevance_per_user_matches_means():
@@ -54,6 +54,9 @@ def test_bootstrap_table():
     assert better["ci_low"] > 0 and better["p_value"] < 0.01
     assert same["ci_low"] < 0 < same["ci_high"] and same["p_value"] > 0.05
     assert better["ci_low"] < better["diff"] < better["ci_high"]
+    # Holm over the two pairs of the metric: the smaller p doubles, the larger stays
+    assert better["p_holm"] == pytest.approx(min(1.0, 2 * better["p_value"]))
+    assert same["p_holm"] == pytest.approx(max(same["p_value"], better["p_holm"]))
     # the CI of a mean difference shrinks like 1 / sqrt(n)
     assert better["ci_high"] - better["ci_low"] == pytest.approx(
         2 * 1.96 * 0.1 / math.sqrt(2000), rel=0.15
@@ -118,6 +121,10 @@ def test_collect_per_user(tmp_path):
         metrics.distinct_categories(recs_idx, artist, 10)
     )
     assert mean("rr_0.1", "kl_ref") > 0
+    counts = prepared.items["count"].to_numpy()
+    expected = counts[recs_idx - N_SPECIAL_TOKENS].mean() / np.sort(counts)[-10:].mean()
+    assert mean("pi_ref", "npcount@10") == pytest.approx(expected, rel=1e-6)
+    assert 0 < mean("pi_ref", "npcount@10") <= 1
     assert mean("rr_0.1", "proxy_ratio@10") >= mean("pi_ref", "proxy_ratio@10")
     assert mean("Repeat", "repeat@10") is None  # relevance only
 
@@ -126,3 +133,11 @@ def test_collect_per_user(tmp_path):
     assert (copy["diff"].abs() < 1e-6).all() and (copy["p_value"] == 1).all()
     assert set(table.filter(pl.col("method") == "Repeat")["metric"]) >= {"ndcg@10", "recall@20"}
     assert "gold_ratio@10" not in set(table.filter(pl.col("method") == "Repeat")["metric"])
+
+
+def test_holm():
+    p = np.array([0.01, 0.04, 0.03, 0.005])
+    # sorted 0.005, 0.01, 0.03, 0.04 -> x4, x3, x2, x1 = 0.02, 0.03, 0.06, 0.04 -> monotone
+    assert holm(p) == pytest.approx([0.03, 0.06, 0.06, 0.02])
+    assert holm(np.array([0.5, 0.9])) == pytest.approx([1.0, 1.0])
+    assert holm(np.array([0.2])) == pytest.approx([0.2])
