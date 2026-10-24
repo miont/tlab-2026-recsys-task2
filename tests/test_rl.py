@@ -29,6 +29,7 @@ from recsys_rl.rl import (
     policy_loss,
     reward_scales,
     sample_contexts,
+    tilted_target,
     train_rl,
 )
 from recsys_rl.train import train
@@ -156,14 +157,16 @@ def expected_reward(policy, rm, reward, batch):
     return (p * reward(rm.score(batch, cand), cand, repeat)).sum(-1).mean().item()
 
 
-@pytest.mark.parametrize("method", ["rloo", "grpo", "bon", "dpo"])
+@pytest.mark.parametrize("method", ["rloo", "grpo", "bon", "dpo", "distill", "exact"])
 def test_policy_loss_improves_reward_and_kl(method):
     policy, ref, rm = tiny_models()
     reward = make_reward()
     batch = tiny_batch()
     next_item = torch.tensor([9, 1, 10])  # the second one is OOV: no SFT target
-    # beta is the KL weight, except for dpo where it scales the preference margin
-    cfg = RLConfig(method=method, group_size=8, kl_beta=1.0 if method == "dpo" else 0.0)
+    # beta is the KL weight, except for dpo where it scales the preference margin and for
+    # distill / exact where it is the temperature of the target
+    beta = {"dpo": 1.0, "distill": 0.01, "exact": 0.01}.get(method, 0.0)
+    cfg = RLConfig(method=method, group_size=8, kl_beta=beta, distill_candidates=5)
     cfg.sft_alpha = 0.1
     gen = torch.Generator().manual_seed(0)
 
@@ -187,6 +190,52 @@ def test_policy_loss_improves_reward_and_kl(method):
     assert stats["kl"] > 0
     with pytest.raises(ValueError):
         policy_loss(policy, ref, rm, reward, batch, next_item, RLConfig(method="ppo"), gen)
+
+
+def test_target_objectives_at_pi_ref():
+    policy, ref, rm = tiny_models()
+    reward = make_reward()
+    batch, next_item = tiny_batch(), torch.tensor([9, 1, 10])
+    for method in ("distill", "exact"):
+        cfg = RLConfig(method=method, kl_beta=0.1, distill_candidates=4)
+        loss, stats = policy_loss(policy, ref, rm, reward, batch, next_item, cfg)
+        assert stats["kl"] == pytest.approx(0.0, abs=1e-6) and stats["target_kl_ref"] > 0
+        if method == "distill":  # policy == ref: KL(pi_beta || pi_theta) = KL(pi_beta || pi_ref)
+            assert stats["target_kl"] == pytest.approx(stats["target_kl_ref"], rel=1e-4)
+        else:
+            assert loss.item() == pytest.approx(0.1 * stats["target_kl"], rel=1e-5)
+
+
+def test_train_rl_distill(tmp_path):
+    prepared, device = train_base_and_rms(tmp_path)
+    cfg = make_cfg(tmp_path, run_name="distill")
+    cfg.rl = RLConfig(
+        method="distill", kl_beta=0.05, distill_candidates=20, batch_size=4, steps=2,
+        eval_every=2, warmup_steps=1, amp=False, lr=1e-2,
+    )  # fmt: skip
+    train_rl(cfg, prepared, device)
+    log = [json.loads(line) for line in (cfg.run_dir / "log.jsonl").read_text().splitlines()]
+    assert {"train_target_kl", "train_target_kl_ref", "train_reward"} <= set(log[-1])
+    assert log[-1]["val_kl_ref"] > 0
+
+
+def test_tilted_target_matches_tilt():
+    torch.manual_seed(0)
+    n = 4
+    ref_logp = torch.log_softmax(torch.randn(5, 12, dtype=torch.float64) * 2, -1)
+    candidates = ref_logp.topk(n, 1).indices
+    reward = torch.rand(5, n, dtype=torch.float64)
+    sorted_logp = ref_logp.sort(1, descending=True).values  # rerank.tilt works on the sorted top
+    h_out = -(sorted_logp[:, n:].exp() * sorted_logp[:, n:]).sum(1)
+    for beta in (1.0, 0.1, 0.01):
+        log_q = tilted_target(ref_logp, candidates, reward, beta)
+        assert torch.allclose(log_q.exp().sum(1), torch.ones(5, dtype=torch.float64))
+        _, kl, entropy = tilt(sorted_logp, reward, h_out, beta, 3)
+        assert torch.allclose(kl, (log_q.exp() * (log_q - ref_logp)).sum(1))
+        assert torch.allclose(entropy, -(log_q.exp() * log_q).sum(1))
+        outside = torch.ones_like(ref_logp, dtype=torch.bool).scatter(1, candidates, False)
+        ratio = (log_q - ref_logp)[outside].view(5, -1)  # unscored items keep pi_ref ratios
+        assert torch.allclose(ratio, ratio[:, :1].expand_as(ratio))
 
 
 def test_top_k_sampling():

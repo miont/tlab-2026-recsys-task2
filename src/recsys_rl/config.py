@@ -91,7 +91,7 @@ class RewardModelConfig:
 
 @dataclass
 class RLConfig:
-    method: str = "rloo"  # rloo | grpo | bon | dpo (see rl.py; offpolicy_reinforce: stage 5)
+    method: str = "rloo"  # rloo | grpo | bon | dpo | distill | exact (see rl.py)
     base_run: str = "base"  # policy init and frozen pi_ref: runs/<base_run>/best.pt
     reward_run: str = "rm_proxy"  # RM that gives the reward: runs/<reward_run>/best.pt
     gold_run: str | None = "rm_gold"  # evaluation only; null = no gold metrics
@@ -102,6 +102,7 @@ class RLConfig:
     uncertainty_penalty: float = 0.0  # times the ensemble std of the ratio head
     listen_time_cap: int = 600  # seconds, caps the track length in listen_time (R2)
     group_size: int = 16  # candidates sampled per context
+    distill_candidates: int = 100  # distill / exact: top-N of pi_ref scored for the target
     temperature: float = 1.0
     top_k: int = 0  # sample from the policy's top-k only (0 = whole vocabulary)
     kl_beta: float = 0.1  # KL weight; for dpo the DPO temperature beta

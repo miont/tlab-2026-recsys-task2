@@ -22,10 +22,20 @@ base model ``runs/<rl.base_run>/best.pt``; a frozen copy of it is ``pi_ref``. On
     OneRec): the best sample of the group is chosen, the worst is rejected,
     ``-log sigmoid(kl_beta * margin)`` of their log-ratios to ``pi_ref``; groups whose samples
     all get the same reward give no pair;
+  - ``distill`` / ``exact``: no sampling. The proxy RM scores the top-``distill_candidates``
+    items of ``pi_ref`` and the target is the reranker's ``pi_beta ∝ pi_ref * exp(r / kl_beta)``
+    (``rerank``; items outside the top-N keep the ``pi_ref``-weighted mean reward), exact over
+    the vocabulary. ``distill`` minimises the forward ``KL(pi_beta || pi_theta)`` (cross-entropy
+    to the target, distillation of the reranker); ``exact`` minimises
+    ``kl_beta * KL(pi_theta || pi_beta)``, which equals the RL loss ``-E_pi[r] + kl_beta *
+    KL(pi_theta || pi_ref)`` up to a constant, with the expectation exact over the top-N instead
+    of estimated from ``G`` samples. Together they separate the noise of the sampled gradient
+    from the generalisation of one model over contexts as the cause of the RL-reranker gap;
 
 - loss: objective ``+ kl_beta * KL(pi_theta || pi_ref) + sft_alpha * CE``, where the KL is exact
   over the vocabulary (not added for ``dpo``, whose ``kl_beta`` is the DPO temperature that
-  already keeps it close to ``pi_ref``) and CE is the next-item cross-entropy on the real listen
+  already keeps it close to ``pi_ref``, nor for ``distill`` / ``exact``, whose target already
+  contains it) and CE is the next-item cross-entropy on the real listen
   after the context (an optional anchor to the data).
 
 Dropout is off (the policy stays in eval mode) so that sampling, log-probs and the KL use the
@@ -70,7 +80,8 @@ from recsys_rl.rewards import REWARDS, Reward, score_recommendations
 from recsys_rl.train import amp_dtype, make_optimizer
 from recsys_rl.utils import get_device, load_checkpoint, save_checkpoint, set_seed
 
-METHODS = ("rloo", "grpo", "bon", "dpo")
+METHODS = ("rloo", "grpo", "bon", "dpo", "distill", "exact")
+TARGET_METHODS = ("distill", "exact")  # objectives on the reranker target, without sampling
 
 
 def sample_contexts(
@@ -139,6 +150,19 @@ def dpo_loss(
     return -F.logsigmoid(beta * margin[pairs]).mean(), stats
 
 
+def tilted_target(
+    ref_logp: torch.Tensor, candidates: torch.Tensor, reward: torch.Tensor, beta: float
+) -> torch.Tensor:
+    """``log pi_beta`` ``[B, V]`` of the reranker (``rerank.tilt``): ``ref_logp`` ``[B, V]``
+    tilted by ``exp((r - mean) / beta)`` on ``candidates`` ``[B, N]`` (positions in ``ref_logp``)
+    with rewards ``reward`` ``[B, N]``, where ``mean`` is the ``pi_ref``-weighted mean reward of
+    the candidates, so items outside them keep their ``pi_ref`` ratios."""
+    lp_in = ref_logp.gather(1, candidates)
+    p_in = lp_in.exp()
+    mean = (p_in * reward).sum(1, keepdim=True) / p_in.sum(1, keepdim=True)
+    return F.log_softmax(ref_logp.scatter(1, candidates, lp_in + (reward - mean) / beta), -1)
+
+
 def sample_actions(
     logits: torch.Tensor, cfg: RLConfig, generator: torch.Generator | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -173,7 +197,10 @@ def policy_loss(
         ref_logp = F.log_softmax(ref.next_item_logits(batch)[:, s:].float(), -1)
     logp = F.log_softmax(logits, -1)
 
-    sample_logp, actions = sample_actions(logits, cfg, generator)
+    if cfg.method in TARGET_METHODS:  # the top-N of pi_ref, scored once
+        actions = ref_logp.topk(cfg.distill_candidates, dim=-1).indices
+    else:
+        sample_logp, actions = sample_actions(logits, cfg, generator)
     candidates = actions + s
     with torch.no_grad():
         probs = rm.score(batch, candidates).float()
@@ -189,7 +216,21 @@ def policy_loss(
         "entropy": -(p * logp).sum(-1).mean().item(),
         "repeat_share": (repeat > 0).float().mean().item(),
     }
-    if cfg.method in ("rloo", "grpo"):
+    if cfg.method in TARGET_METHODS:
+        with torch.no_grad():
+            log_q = tilted_target(ref_logp, actions, r, cfg.kl_beta)
+            q = log_q.exp()
+            q_in = q.gather(1, actions)
+            stats["reward"] = ((q_in * r).sum(1) / q_in.sum(1)).mean().item()  # under pi_beta
+            stats["target_kl_ref"] = (q * (log_q - ref_logp)).sum(-1).mean().item()
+        if cfg.method == "distill":
+            objective = -(q * logp).sum(-1).mean()
+            stats["target_kl"] = (q * (log_q - logp.detach())).sum(-1).mean().item()
+        else:
+            target_kl = (p * (logp - log_q)).sum(-1).mean()
+            objective = cfg.kl_beta * target_kl
+            stats["target_kl"] = target_kl.item()
+    elif cfg.method in ("rloo", "grpo"):
         adv = advantages(r, cfg.method, cfg.grpo_std)
         objective = -(adv * sample_logp.gather(1, actions)).mean()
     elif cfg.method == "bon":
@@ -200,7 +241,8 @@ def policy_loss(
         stats |= dpo_stats
     else:
         raise ValueError(f"unknown method {cfg.method!r}, expected one of {METHODS}")
-    loss = objective if cfg.method == "dpo" else objective + cfg.kl_beta * kl
+    regularised = cfg.method == "dpo" or cfg.method in TARGET_METHODS
+    loss = objective if regularised else objective + cfg.kl_beta * kl
     stats["objective"] = objective.item()
     if cfg.sft_alpha:
         valid = next_item >= s
