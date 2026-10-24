@@ -59,6 +59,14 @@ def relevance_metrics(
     recs: np.ndarray, targets: Sequence[np.ndarray], ks: Sequence[int] = (10, 100)
 ) -> dict[str, float]:
     """Recall@K, NDCG@K and MAP@K averaged over users (see module docstring)."""
+    per_user = relevance_per_user(recs, targets, ks)
+    return {name: float(np.mean(values)) for name, values in per_user.items()}
+
+
+def relevance_per_user(
+    recs: np.ndarray, targets: Sequence[np.ndarray], ks: Sequence[int] = (10, 100)
+) -> dict[str, np.ndarray]:
+    """Recall@K, NDCG@K and MAP@K of every user, ``[n_users]`` each (for paired tests)."""
     recs = _check(recs, max(ks))
     n_targets = np.array([len(np.unique(t)) for t in targets], dtype=np.float64)
     if (n_targets == 0).any():
@@ -72,9 +80,9 @@ def relevance_metrics(
         n_ideal = np.minimum(n_targets, k).astype(int)
         idcg = np.cumsum(discounts[:k])[n_ideal - 1]
         precision_at_i = np.cumsum(h, axis=1) / ranks[:k]
-        out[f"recall@{k}"] = float(np.mean(h.sum(1) / n_targets))
-        out[f"ndcg@{k}"] = float(np.mean((h * discounts[:k]).sum(1) / idcg))
-        out[f"map@{k}"] = float(np.mean((precision_at_i * h).sum(1) / n_ideal))
+        out[f"recall@{k}"] = h.sum(1) / n_targets
+        out[f"ndcg@{k}"] = (h * discounts[:k]).sum(1) / idcg
+        out[f"map@{k}"] = (precision_at_i * h).sum(1) / n_ideal
     return out
 
 
