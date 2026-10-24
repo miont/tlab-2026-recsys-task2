@@ -31,6 +31,14 @@ base model ``runs/<rl.base_run>/best.pt``; a frozen copy of it is ``pi_ref``. On
     KL(pi_theta || pi_ref)`` up to a constant, with the expectation exact over the top-N instead
     of estimated from ``G`` samples. Together they separate the noise of the sampled gradient
     from the generalisation of one model over contexts as the cause of the RL-reranker gap;
+  - ``slate``: a list-level reward without changing the model (level 1 of the slate study; the
+    Next-K generation of GPTRec, Petrov & Macdonald, 2024, would condition each position on the
+    earlier ones). ``group_size`` ordered lists of ``slate_size`` items are drawn without
+    replacement from the sampling distribution, i.e. Plackett-Luce lists of the one softmax;
+    a list's reward is the mean item reward plus ``slate_diversity`` * (distinct artists) /
+    ``slate_size``, so ``slate_diversity`` is the value of one more artist per position, in
+    reward units; the gradient is RLOO over the lists with the exact Plackett-Luce
+    log-probability of each list. The per-item ``artist_penalty`` must be off;
 
 - ``offpolicy``: session-level off-policy REINFORCE on the logs (Matveev et al., 2026,
   arXiv:2607.02818), no RM and no sampling. A batch is ``batch_size`` whole train windows; the
@@ -98,7 +106,7 @@ from recsys_rl.rewards import NO_PENALTIES, REWARDS, Reward, score_recommendatio
 from recsys_rl.train import amp_dtype, make_optimizer
 from recsys_rl.utils import get_device, load_checkpoint, save_checkpoint, set_seed
 
-METHODS = ("rloo", "grpo", "bon", "dpo", "distill", "exact", "offpolicy")
+METHODS = ("rloo", "grpo", "bon", "dpo", "distill", "exact", "slate", "offpolicy")
 TARGET_METHODS = ("distill", "exact")  # objectives on the reranker target, without sampling
 
 
@@ -314,20 +322,60 @@ def offpolicy_loss(
     return loss, stats
 
 
-def sample_actions(
-    logits: torch.Tensor, cfg: RLConfig, generator: torch.Generator | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(sample_logp, actions)``: the sampling distribution (``temperature``, ``top_k``) over
-    ``logits`` ``[B, V]`` and ``group_size`` actions per row drawn from it with replacement."""
+def sampling_log_probs(logits: torch.Tensor, cfg: RLConfig) -> torch.Tensor:
+    """Log of the sampling distribution (``temperature``, ``top_k``) over ``logits``."""
     sample_logits = logits / cfg.temperature
     if cfg.top_k:
         kth = sample_logits.topk(cfg.top_k, dim=-1).values[:, -1:]
         sample_logits = sample_logits.masked_fill(sample_logits < kth, float("-inf"))
-    sample_logp = F.log_softmax(sample_logits, -1)
+    return F.log_softmax(sample_logits, -1)
+
+
+def sample_actions(
+    logits: torch.Tensor, cfg: RLConfig, generator: torch.Generator | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(sample_logp, actions)``: the sampling distribution over ``logits`` ``[B, V]`` and
+    ``group_size`` actions per row drawn from it with replacement."""
+    sample_logp = sampling_log_probs(logits, cfg)
     actions = torch.multinomial(
         sample_logp.detach().exp(), cfg.group_size, replacement=True, generator=generator
     )
     return sample_logp, actions
+
+
+def sample_slates(
+    sample_logp: torch.Tensor,
+    group_size: int,
+    slate_size: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """``[B, G, L]`` ordered lists drawn without replacement from ``exp(sample_logp)``
+    ``[B, V]``; ``torch.multinomial`` returns them in drawing order, so each list is a
+    Plackett-Luce sample."""
+    probs = sample_logp.detach().exp()
+    if (probs > 0).sum(1).min() < slate_size:
+        raise ValueError(f"fewer than slate_size = {slate_size} items can be sampled (top_k)")
+    draws = [
+        torch.multinomial(probs, slate_size, replacement=False, generator=generator)
+        for _ in range(group_size)
+    ]
+    return torch.stack(draws, 1)
+
+
+def plackett_luce_log_prob(logp: torch.Tensor, slates: torch.Tensor) -> torch.Tensor:
+    """``[B, G]`` log-probability of the ordered ``slates`` ``[B, G, L]`` drawn one by one
+    without replacement from ``exp(logp)`` ``[B, V]``:
+    ``sum_j log p(a_j) - log(1 - sum_{i < j} p(a_i))``."""
+    lp = logp.gather(1, slates.flatten(1)).view_as(slates)
+    p = lp.exp()
+    used = p.cumsum(-1) - p  # mass of the items drawn before
+    return (lp - torch.log1p(-used.clamp(max=1 - 1e-6))).sum(-1)
+
+
+def distinct_count(categories: torch.Tensor) -> torch.Tensor:
+    """Number of distinct values along the last dimension."""
+    ordered = categories.sort(-1).values
+    return 1 + (ordered.diff(dim=-1) != 0).sum(-1)
 
 
 def policy_loss(
@@ -350,6 +398,12 @@ def policy_loss(
 
     if cfg.method in TARGET_METHODS:  # the top-N of pi_ref, scored once
         actions = ref_logp.topk(cfg.distill_candidates, dim=-1).indices
+    elif cfg.method == "slate":
+        if reward.cfg.artist_penalty:
+            raise ValueError("slate rewards distinct artists itself: set artist_penalty = 0")
+        sample_logp = sampling_log_probs(logits, cfg)
+        slates = sample_slates(sample_logp, cfg.group_size, cfg.slate_size, generator)
+        actions = slates.flatten(1)  # [B, G * L], scored by the RM as one row
     else:
         sample_logp, actions = sample_actions(logits, cfg, generator)
     candidates = actions + s
@@ -386,6 +440,18 @@ def policy_loss(
     elif cfg.method in ("rloo", "grpo"):
         adv = advantages(r, cfg.method, cfg.grpo_std)
         objective = -(adv * sample_logp.gather(1, actions)).mean()
+    elif cfg.method == "slate":
+        item_r = r.view_as(slates)
+        slate_r = item_r.mean(-1)
+        stats["item_reward"] = stats["reward"]
+        if cfg.slate_diversity or reward.item_artist is not None:
+            artists = distinct_count(reward.artist_categories(candidates).view_as(slates))
+            slate_r = slate_r + cfg.slate_diversity * artists / cfg.slate_size
+            stats["slate_artists"] = artists.float().mean().item()
+        stats["reward"] = slate_r.mean().item()
+        stats["reward_std"] = slate_r.std(1).mean().item()
+        adv = advantages(slate_r, "rloo")
+        objective = -(adv * plackett_luce_log_prob(sample_logp, slates)).mean()
     elif cfg.method == "bon":
         best = actions.gather(1, r.argmax(1, keepdim=True))
         objective = -logp.gather(1, best).mean()

@@ -93,7 +93,7 @@ class RewardModelConfig:
 
 @dataclass
 class RLConfig:
-    method: str = "rloo"  # rloo | grpo | bon | dpo | distill | exact | offpolicy (see rl.py)
+    method: str = "rloo"  # rloo|grpo|bon|dpo|distill|exact|slate|offpolicy (see rl.py)
     base_run: str = "base"  # policy init and frozen pi_ref: runs/<base_run>/best.pt
     reward_run: str = "rm_proxy"  # RM that gives the reward: runs/<reward_run>/best.pt
     gold_run: str | None = "rm_gold"  # evaluation only; null = no gold metrics
@@ -107,6 +107,9 @@ class RLConfig:
     listen_time_cap: int = 600  # seconds, caps the track length in listen_time (R2)
     group_size: int = 16  # candidates sampled per context
     distill_candidates: int = 100  # distill / exact: top-N of pi_ref scored for the target
+    # slate: group_size lists of slate_size items sampled without replacement (Plackett-Luce)
+    slate_size: int = 10
+    slate_diversity: float = 0.0  # reward per distinct artist of the list, per position
     # offpolicy (Matveev et al., 2026): REINFORCE on logged recommendations, no RM
     behavior_run: str = "behavior"  # pi_b: runs/<behavior_run>/best.pt (train.target=recommended)
     offpolicy_reward: str = "like_ratio"  # like + ratio / 10 (the paper) | ratio

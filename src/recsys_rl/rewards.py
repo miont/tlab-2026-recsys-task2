@@ -23,7 +23,9 @@ have its artist (tracks without a known artist share with no one), weighted by `
 given. It is the only list-level term: with RL samples (no weights) it estimates the policy's
 mass on the candidate's artist (sampling with replacement, so a repeated item counts too); with
 the ``pi_ref``-weighted top-N of the reranker it is the artist's ``pi_ref`` mass among the
-candidates; on a top-K list it is the artist duplication of the list itself.
+candidates; on a top-K list it is the artist duplication of the list itself. The slate-level
+alternative (``rl.method=slate``, ``rerank.greedy_slate``) instead rewards the number of
+distinct artists of a whole list (``Reward.artist_categories``).
 
 Track lengths and mean ratios come from train listens only (``items`` and the train rows of the
 store), as the leak rules require.
@@ -180,6 +182,14 @@ class Reward(nn.Module):
         w = torch.ones_like(candidates, dtype=torch.float) if weights is None else weights.float()
         others = w.sum(1, keepdim=True) - w  # total weight of the other candidates
         return (same.float() * w[:, None, :]).sum(-1) / others.clamp_min(1e-12)
+
+    def artist_categories(self, candidates: torch.Tensor) -> torch.Tensor:
+        """Artist of each candidate (vocabulary indices); a track without a known artist is
+        a category of its own (``-1 - index``), as in ``metrics.distinct_categories``."""
+        if self.item_artist is None:
+            raise ValueError("artist categories need item_artist (artist_item_mapping.parquet)")
+        artist = self.item_artist[candidates]
+        return torch.where(artist >= 0, artist, -1 - candidates)
 
     def forward(
         self,

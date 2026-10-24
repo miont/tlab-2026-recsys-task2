@@ -13,8 +13,9 @@ replacement for both methods, and the statistic is the mean per-user difference.
   ``ratio``, length-``debiased`` ratio of R4, ``like``, ``continue`` of R6). The RM columns do
   not depend on the reward a method was trained or reranked with, so R1 and R4 methods share
   them.
-  Methods: ``pi_ref``, the Repeat baseline (relevance only), RL checkpoints and reranker points
-  ``(reward, beta)`` of ``rerank.tilt``. ``exclude_seen`` rows exist for ``pi_ref`` and the RL
+  Methods: ``pi_ref``, the Repeat baseline (relevance only), RL checkpoints, reranker points
+  ``(reward, beta)`` of ``rerank.tilt`` and greedy slate points ``(reward, beta, diversity)``
+  of ``rerank.slate_tops``. ``exclude_seen`` rows exist for ``pi_ref`` and the RL
   checkpoints (relevance only; the reranker has no repeat-filter mode).
 - ``bootstrap_table`` compares (method, baseline) pairs on every metric with the same bootstrap
   resamples, per split and repeat-filter mode: means, difference, percentile CI, a two-sided
@@ -36,7 +37,7 @@ from recsys_rl.config import Config
 from recsys_rl.data import EventStore, PreparedData, prepare
 from recsys_rl.evaluate import EvalSet
 from recsys_rl.model import load_model
-from recsys_rl.rerank import candidate_scores, tilt
+from recsys_rl.rerank import candidate_scores, slate_tops, tilt
 from recsys_rl.reward_model import RewardModel
 from recsys_rl.rewards import NO_PENALTIES, Reward, score_recommendations
 from recsys_rl.rl import item_features, load_frozen_rm, policy_eval
@@ -86,14 +87,17 @@ def collect_per_user(
     split: str = "val",
     policies: Mapping[str, str | Path] | None = None,
     rerank: Mapping[str, tuple[str | Mapping[str, Any], float]] | None = None,
+    slates: Mapping[str, tuple[str | Mapping[str, Any], float, float]] | None = None,
     n_candidates: int = 100,
+    slate_size: int = 10,
     k: int = 100,
     exclude_seen: bool = True,
 ) -> pl.DataFrame:
     """Per-user metrics of ``pi_ref`` (``runs/<rl.base_run>/best.pt``), Repeat, the
     ``policies`` (name -> checkpoint) and the ``rerank`` points (name -> (reward, beta), where
     the reward is a name or a dict of ``Reward.variant`` changes such as R5 penalties), scored
-    by the proxy / gold RMs of ``cfg.rl``; see the module docstring. Relevance is at 10 and
+    by the proxy / gold RMs of ``cfg.rl``, and the greedy ``slates`` (name -> (reward, beta,
+    diversity), lists of ``slate_size``); see the module docstring. Relevance is at 10 and
     ``k``; ``exclude_seen = False`` skips the repeat-filter rows."""
     r = cfg.rl
     device = device or get_device()
@@ -145,17 +149,22 @@ def collect_per_user(
         add_vocab(name, recs, kl)
         add_unseen(name, policy)
         del policy
-    by_reward: dict[tuple, list[tuple[str, float]]] = {}
-    for name, (spec, beta) in (rerank or {}).items():
+    by_reward: dict[tuple, list[tuple[str, float, float | None]]] = {}
+    points = [(n, spec, beta, None) for n, (spec, beta) in (rerank or {}).items()]
+    points += [(n, spec, beta, div) for n, (spec, beta, div) in (slates or {}).items()]
+    for name, spec, beta, diversity in points:
         changes = {"reward": spec} if isinstance(spec, str) else dict(spec)
-        by_reward.setdefault(tuple(sorted(changes.items())), []).append((name, beta))
-    for changes, points in by_reward.items():  # the RM scores the candidates once per reward
+        by_reward.setdefault(tuple(sorted(changes.items())), []).append((name, beta, diversity))
+    for changes, group in by_reward.items():  # the RM scores the candidates once per reward
+        variant = reward.variant(**dict(changes))
         cands = candidate_scores(
-            ref, rms["proxy"], reward.variant(**dict(changes)), store, es, n_candidates, k,
-            amp_dtype=dtype,
-        )  # fmt: skip
-        for name, beta in points:
-            top, kl, _ = tilt(cands["logp"], cands["reward"], cands["h_out"], beta, k)
+            ref, rms["proxy"], variant, store, es, n_candidates, k, amp_dtype=dtype
+        )
+        for name, beta, diversity in group:
+            if diversity is None:
+                top, kl, _ = tilt(cands["logp"], cands["reward"], cands["h_out"], beta, k)
+            else:
+                top, kl, _ = slate_tops(cands, variant, beta, diversity, slate_size, k)
             add_vocab(name, cands["idx"].gather(1, top).numpy(), kl.numpy())
     return pl.concat(frames, how="diagonal_relaxed")
 
