@@ -4,7 +4,7 @@
 -- * line-break points after "@" in text (metric names like Recall@100 in narrow table
 --   columns) and after "_", "/", "." in inline code (file names).
 local replacements = { ["⏳"] = "\\pending{}", ["@"] = "@\\allowbreak{}" }
-for _, char in ipairs({ "−", "→", "↔", "≈", "≡", "≤", "≥", "∈", "∝", "∞", "‖" }) do
+for _, char in ipairs({ "−", "→", "↔", "≈", "≡", "≤", "≥", "≫", "∈", "∝", "∞", "‖" }) do
   replacements[char] = "\\ensuremath{" .. char .. "}"
 end
 
