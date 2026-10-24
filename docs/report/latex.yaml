@@ -1,0 +1,34 @@
+# pandoc defaults for the PDF report (XeLaTeX); used by build_pdf.sh
+from: markdown
+to: latex
+pdf-engine: xelatex
+standalone: true
+toc: true
+toc-depth: 2
+resource-path: [".", "../.."]
+filters: [latex.lua]
+variables:
+  documentclass: article
+  papersize: a4
+  fontsize: 11pt
+  geometry: [margin=2cm]
+  mainfont: Noto Serif
+  sansfont: Noto Sans
+  monofont: DejaVu Sans Mono
+  monofontoptions: [Scale=0.85]
+  mathfont: Latin Modern Math
+  linestretch: 1.1
+  colorlinks: true
+  linkcolor: blue!50!black
+  urlcolor: blue!50!black
+  toccolor: black
+  header-includes:
+    - \usepackage{etoolbox}
+    - \AtBeginEnvironment{longtable}{\footnotesize\setlength{\tabcolsep}{3pt}}
+    - \usepackage[font=small,labelfont=bf]{caption}
+    - \setlength{\emergencystretch}{3em}
+    - \usepackage{titlesec}
+    - \titleformat{\section}{\sffamily\Large\bfseries}{}{0pt}{}
+    - \titleformat{\subsection}{\sffamily\large\bfseries}{}{0pt}{}
+    - \titleformat{\subsubsection}{\sffamily\normalsize\bfseries}{}{0pt}{}
+    - \newcommand{\pending}{\textcolor{orange!70!black}{\textsf{[ждёт Colab]}}}
