@@ -58,9 +58,11 @@ class TrainConfig:
     n_negatives: int = 8192
     grad_clip: float = 1.0
     amp: bool = True
-    # Next-item target: "all" (every listen, the task statement) or "listen_plus"
-    # (only Listen+ targets contribute to the loss, next-positive ablation).
+    # Next-item target: "all" (every listen, the task statement), "listen_plus"
+    # (only Listen+ targets contribute to the loss, next-positive ablation) or "recommended"
+    # (only non-organic targets: the behaviour model of the off-policy branch).
     target: str = "all"
+    init_run: str | None = None  # start from runs/<init_run>/best.pt (fine-tuning)
     eval_every: int = 1000
     patience: int = 5  # early stopping: evaluations without a val NDCG@10 improvement
     max_steps: int = 0  # 0 = run all epochs; > 0 caps the run (smoke tests)
@@ -91,7 +93,7 @@ class RewardModelConfig:
 
 @dataclass
 class RLConfig:
-    method: str = "rloo"  # rloo | grpo | bon | dpo | distill | exact (see rl.py)
+    method: str = "rloo"  # rloo | grpo | bon | dpo | distill | exact | offpolicy (see rl.py)
     base_run: str = "base"  # policy init and frozen pi_ref: runs/<base_run>/best.pt
     reward_run: str = "rm_proxy"  # RM that gives the reward: runs/<reward_run>/best.pt
     gold_run: str | None = "rm_gold"  # evaluation only; null = no gold metrics
@@ -105,6 +107,12 @@ class RLConfig:
     listen_time_cap: int = 600  # seconds, caps the track length in listen_time (R2)
     group_size: int = 16  # candidates sampled per context
     distill_candidates: int = 100  # distill / exact: top-N of pi_ref scored for the target
+    # offpolicy (Matveev et al., 2026): REINFORCE on logged recommendations, no RM
+    behavior_run: str = "behavior"  # pi_b: runs/<behavior_run>/best.pt (train.target=recommended)
+    offpolicy_reward: str = "like_ratio"  # like + ratio / 10 (the paper) | ratio
+    offpolicy_k: int = 10  # weight factors: current + K - 1 next actions (1 = Chen, 0 = none)
+    offpolicy_cap: float = 0.5  # cap of the weight
+    offpolicy_gamma: float = 0.9  # discount of the return within a trajectory
     temperature: float = 1.0
     top_k: int = 0  # sample from the policy's top-k only (0 = whole vocabulary)
     kl_beta: float = 0.1  # KL weight; for dpo the DPO temperature beta

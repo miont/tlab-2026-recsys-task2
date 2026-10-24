@@ -26,7 +26,13 @@ from torch import nn
 from recsys_rl import evaluate
 from recsys_rl.config import Config, save_config
 from recsys_rl.data import N_SPECIAL_TOKENS, PreparedData, prepare
-from recsys_rl.model import GPT2Recommender, sampled_softmax_loss, save_model, to_tensors
+from recsys_rl.model import (
+    GPT2Recommender,
+    load_model,
+    sampled_softmax_loss,
+    save_model,
+    to_tensors,
+)
 from recsys_rl.utils import get_device, load_checkpoint, save_checkpoint, set_seed
 
 
@@ -98,13 +104,17 @@ def next_item_loss(
     """Sampled-softmax loss of predicting every listen of the windows from its prefix.
 
     Padding and OOV targets are skipped; ``target="listen_plus"`` also skips targets with
-    ``played_ratio_pct < min_ratio`` (their inputs still feed the context).
+    ``played_ratio_pct < min_ratio`` and ``target="recommended"`` organic targets, which gives
+    the behaviour model of the recommender (``rl`` off-policy branch); the skipped listens
+    still feed the context.
     """
     hidden = model(batch)[:, :-1]
     targets = batch["item_idx"][:, 1:]
     valid = batch["mask"][:, 1:] & (targets >= N_SPECIAL_TOKENS)
     if target == "listen_plus":
         valid &= batch["played_ratio_pct"][:, 1:] >= min_ratio
+    elif target == "recommended":
+        valid &= batch["is_organic"][:, 1:] == 0
     elif target != "all":
         raise ValueError(f"unknown target {target!r}")
     negatives = torch.multinomial(log_q.exp(), n_negatives, replacement=True)
@@ -129,6 +139,12 @@ def train(
     min_ratio = round(cfg.data.listen_plus_threshold * 100)
 
     model = build_model(cfg, n_items).to(device)
+    last_path, best_path = run_dir / "last.pt", run_dir / "best.pt"
+    if t.init_run and not last_path.exists():  # fine-tuning; a resumed run has its own weights
+        init = load_model(Path(cfg.data_root) / "runs" / t.init_run / "best.pt")
+        if init.n_items != n_items:
+            raise ValueError(f"{t.init_run} has another vocabulary ({init.n_items} items)")
+        model.load_state_dict(init.state_dict())
     optimizer = make_optimizer(model, t.lr, t.weight_decay)
     n_windows = len(prepared.window_starts)
     batches_per_epoch = n_windows // t.batch_size
@@ -143,7 +159,6 @@ def train(
     log_q = proposal_log_q(items, n_items).to(device)
 
     state = {"step": 0, "epoch": 0, "batch": 0, "best": -1.0, "bad_evals": 0}
-    last_path, best_path = run_dir / "last.pt", run_dir / "best.pt"
     if last_path.exists():
         ckpt = load_checkpoint(last_path, map_location=device)
         model.load_state_dict(ckpt["model"])

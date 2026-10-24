@@ -32,6 +32,23 @@ base model ``runs/<rl.base_run>/best.pt``; a frozen copy of it is ``pi_ref``. On
     of estimated from ``G`` samples. Together they separate the noise of the sampled gradient
     from the generalisation of one model over contexts as the cause of the RL-reranker gap;
 
+- ``offpolicy``: session-level off-policy REINFORCE on the logs (Matveev et al., 2026,
+  arXiv:2607.02818), no RM and no sampling. A batch is ``batch_size`` whole train windows; the
+  actions are the logged recommendations (``is_organic = 0``, known item, position >= 1), a
+  trajectory is a run of consecutive recommendations within one session (an organic listen,
+  a new session or an OOV track ends it). Reward from the logs ``r_t`` = ``like + ratio / 10``
+  (``offpolicy_reward = like_ratio``, the paper) or the played ratio (``ratio``), like labels
+  leak-free with respect to ``train_end`` (``reward_model.feedback_targets``); return
+  ``R_t = sum_{tau >= t} gamma^(tau - t) r_tau`` within the trajectory. Weight
+  ``w_t = min(cap, prod_{tau = t}^{t + K - 1} pi_theta(a_tau|x_tau) / pi_b(a_tau|x_tau))`` over
+  the current and at most ``K - 1`` next actions of the trajectory (``K = 1`` is the top-1
+  correction of Chen et al., 2019, ``K = 0`` no correction), with ``pi_b`` the frozen
+  behaviour model ``runs/<behavior_run>/best.pt`` (next recommended item,
+  ``train.target=recommended``);
+  weights are constants for the gradient. Objective
+  ``-sum gamma^s_t w_t R_t log pi_theta(a_t|x_t) / sum gamma^s_t w_t``, ``s_t`` the index of
+  the action in its trajectory, no baseline (as in the paper); ``kl_beta`` adds the exact
+  ``KL(pi_theta || pi_ref)`` at the action states (the paper has none: use 0);
 - loss: objective ``+ kl_beta * KL(pi_theta || pi_ref) + sft_alpha * CE``, where the KL is exact
   over the vocabulary (not added for ``dpo``, whose ``kl_beta`` is the DPO temperature that
   already keeps it close to ``pi_ref``, nor for ``distill`` / ``exact``, whose target already
@@ -74,13 +91,14 @@ from recsys_rl.reward_model import (
     HEAD_INDEX,
     RewardModel,
     context_repeat_counts,
+    feedback_targets,
     load_reward_model,
 )
 from recsys_rl.rewards import NO_PENALTIES, REWARDS, Reward, score_recommendations
 from recsys_rl.train import amp_dtype, make_optimizer
 from recsys_rl.utils import get_device, load_checkpoint, save_checkpoint, set_seed
 
-METHODS = ("rloo", "grpo", "bon", "dpo", "distill", "exact")
+METHODS = ("rloo", "grpo", "bon", "dpo", "distill", "exact", "offpolicy")
 TARGET_METHODS = ("distill", "exact")  # objectives on the reranker target, without sampling
 
 
@@ -161,6 +179,139 @@ def tilted_target(
     p_in = lp_in.exp()
     mean = (p_in * reward).sum(1, keepdim=True) / p_in.sum(1, keepdim=True)
     return F.log_softmax(ref_logp.scatter(1, candidates, lp_in + (reward - mean) / beta), -1)
+
+
+def logged_actions(batch: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(action, trajectory)`` ``[B, T]`` of whole windows for the off-policy branch: ``action``
+    marks the logged recommendations that can be scored (non-organic, known item, position
+    >= 1); ``trajectory`` numbers the runs of consecutive actions within a session (-1 for
+    non-actions)."""
+    action = batch["mask"] & (batch["is_organic"] == 0) & (batch["item_idx"] >= N_SPECIAL_TOKENS)
+    action[:, 0] = False  # no context to score the first listen of a window
+    prev = torch.zeros_like(action)
+    prev[:, 1:] = action[:, :-1] & (batch["session_id"][:, 1:] == batch["session_id"][:, :-1])
+    start = action & ~prev
+    rows = torch.arange(len(action), device=action.device)[:, None] * action.shape[1]
+    trajectory = torch.where(action, start.long().cumsum(1) - 1 + rows, -1)  # unique per row
+    return action, trajectory
+
+
+def offpolicy_terms(
+    log_ratio: torch.Tensor,
+    reward: torch.Tensor,
+    trajectory: torch.Tensor,
+    gamma: float,
+    k: int,
+    cap: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(coef, ret, weight)`` ``[B, T]`` of the off-policy gradient (module docstring) from the
+    per-action ``log_ratio`` = ``log pi_theta - log pi_b`` and ``reward``: ``coef`` =
+    ``gamma^s * min(cap, w)``, ``ret`` the discounted return within the trajectory and
+    ``weight`` the uncapped ``K``-step weight (1 for ``k = 0``: no correction, the paper's
+    ablation); all zero outside actions."""
+    action = trajectory >= 0
+    t_len = trajectory.shape[1]
+    same_next = action[:, 1:] & (trajectory[:, 1:] == trajectory[:, :-1])  # t and t+1 chained
+    zero = torch.zeros_like(reward[:, 0])
+    ret = torch.zeros_like(reward)
+    running = zero
+    for t in reversed(range(t_len)):
+        cont = same_next[:, t] if t < t_len - 1 else torch.zeros_like(action[:, 0])
+        running = reward[:, t] + gamma * running * cont
+        ret[:, t] = running
+    step = torch.zeros_like(reward)
+    for t in range(1, t_len):
+        step[:, t] = torch.where(same_next[:, t - 1], step[:, t - 1] + 1, 0)
+    log_ratio = torch.where(action, log_ratio, 0)
+    total, alive = log_ratio.clone(), action.clone()
+    for shift in range(1, min(k, t_len)):
+        alive = alive[:, :-1] & same_next[:, shift - 1 :]  # t .. t + shift chained
+        total[:, : t_len - shift] += torch.where(alive, log_ratio[:, shift:], 0)
+    weight = torch.where(action, total.exp() if k > 0 else torch.ones_like(total), 0)
+    coef = torch.where(action, gamma**step * weight.clamp(max=cap), 0)
+    return coef, torch.where(action, ret, 0), weight
+
+
+def logged_log_probs(
+    policy: GPT2Recommender,
+    ref: GPT2Recommender,
+    behavior: GPT2Recommender,
+    batch: Mapping[str, torch.Tensor],
+    action: torch.Tensor,
+    with_kl: bool,
+    chunk: int = 2048,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """``(logp, behavior_logp, kl)`` ``[N]`` at the ``N`` action positions (row-major): the
+    policy's log-probability of the logged item (with gradient), the behaviour model's and,
+    if ``with_kl``, the exact ``KL(pi_theta || pi_ref)`` of the state. The full softmax is
+    computed in chunks of states."""
+    s = N_SPECIAL_TOKENS
+    rows, cols = action.nonzero(as_tuple=True)
+    items = batch["item_idx"][rows, cols] - s  # positions in the softmax without specials
+    h = policy(batch)[rows, cols - 1]  # the state before the action
+    with torch.no_grad():
+        h_b = behavior(batch)[rows, cols - 1]
+        h_ref = ref(batch)[rows, cols - 1] if with_kl else None
+    logp, logp_b, kl = [], [], []
+    for start in range(0, len(items), chunk):
+        sl = slice(start, start + chunk)
+        lp = F.log_softmax(policy.scores(h[sl])[:, s:].float(), -1)
+        logp.append(lp.gather(1, items[sl, None])[:, 0])
+        with torch.no_grad():
+            lb = F.log_softmax(behavior.scores(h_b[sl])[:, s:].float(), -1)
+            logp_b.append(lb.gather(1, items[sl, None])[:, 0])
+        if with_kl:
+            with torch.no_grad():
+                lr = F.log_softmax(ref.scores(h_ref[sl])[:, s:].float(), -1)
+            kl.append((lp.exp() * (lp - lr)).sum(-1))
+    cat = torch.cat
+    return cat(logp), cat(logp_b), (cat(kl) if with_kl else None)
+
+
+def offpolicy_loss(
+    policy: GPT2Recommender,
+    ref: GPT2Recommender,
+    behavior: GPT2Recommender,
+    batch: Mapping[str, torch.Tensor],
+    targets: torch.Tensor,
+    cfg: RLConfig,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Loss of one off-policy step on whole windows; ``targets`` ``[B, T, H]`` are the logged
+    feedback labels of ``reward_model.feedback_targets`` (leak-free likes)."""
+    action, trajectory = logged_actions(batch)
+    if cfg.offpolicy_reward == "like_ratio":
+        reward = targets[..., HEAD_INDEX["like"]] + targets[..., HEAD_INDEX["ratio"]] / 10
+    elif cfg.offpolicy_reward == "ratio":
+        reward = targets[..., HEAD_INDEX["ratio"]]
+    else:
+        raise ValueError(f"unknown offpolicy_reward {cfg.offpolicy_reward!r}")
+    if not action.any():
+        zero = sum(p.sum() for p in policy.parameters()) * 0
+        return zero, {"n_actions": 0.0}
+    logp, logp_b, kl = logged_log_probs(policy, ref, behavior, batch, action, cfg.kl_beta > 0)
+    log_ratio = torch.zeros_like(reward)
+    log_ratio[action] = (logp - logp_b).detach()
+    coef, ret, weight = offpolicy_terms(
+        log_ratio, reward, trajectory, cfg.offpolicy_gamma, cfg.offpolicy_k, cfg.offpolicy_cap
+    )
+    c, g = coef[action], ret[action]
+    objective = -(c * g * logp).sum() / c.sum().clamp_min(1e-12)
+    loss = objective + (cfg.kl_beta * kl.mean() if kl is not None else 0)
+    w = weight[action]
+    stats = {
+        "objective": objective.item(),
+        "reward": reward[action].mean().item(),
+        "return": g.mean().item(),
+        "n_actions": float(action.sum().item()),
+        "log_ratio": log_ratio[action].mean().item(),
+        "weight": w.mean().item(),
+        "capped_share": (w > cfg.offpolicy_cap).float().mean().item(),
+        "ess_share": (c.sum() ** 2 / (c**2).sum().clamp_min(1e-12) / len(c)).item(),
+        "logp": logp.mean().item(),
+    }
+    if kl is not None:
+        stats["kl"] = kl.mean().item()
+    return loss, stats
 
 
 def sample_actions(
@@ -423,6 +574,12 @@ def train_rl(
     policy = load_model(base_path, device).eval()
     ref = load_model(base_path, device).eval().requires_grad_(False)
     seq_len = policy.backbone.config.n_positions
+    behavior = None
+    if r.method == "offpolicy":
+        behavior_path = Path(cfg.data_root) / "runs" / r.behavior_run / "best.pt"
+        behavior = load_model(behavior_path, device).eval().requires_grad_(False)
+        if behavior.n_items != policy.n_items:
+            raise ValueError("the behaviour model does not match the base model's vocabulary")
     rm = load_frozen_rm(cfg, r.reward_run, device)
     rms = {"proxy": rm}
     if r.gold_run:
@@ -501,13 +658,27 @@ def train_rl(
     while state["step"] < r.steps:
         rng = np.random.default_rng([cfg.seed, state["step"]])
         generator.manual_seed(cfg.seed * 1_000_003 + state["step"])
-        ctx_starts, ctx_lengths = sample_contexts(store, starts, lengths, r.batch_size, rng)
-        batch = to_tensors(store.gather(ctx_starts, ctx_lengths, seq_len, bounds.train_end), device)
-        next_item = torch.from_numpy(
-            np.asarray(store.columns["item_idx"])[ctx_starts + ctx_lengths].astype(np.int64)
-        ).to(device)
-        with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
-            loss, step_stats = policy_loss(policy, ref, rm, reward, batch, next_item, r, generator)
+        if r.method == "offpolicy":  # whole windows with their logged recommendations
+            sel = rng.integers(0, len(starts), r.batch_size)
+            raw = store.gather(starts[sel], lengths[sel], seq_len, bounds.train_end)
+            targets, _ = feedback_targets(raw, bounds.train_end, cfg.data, cfg.rm.skip_threshold)
+            batch = to_tensors(raw, device)
+            with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
+                loss, step_stats = offpolicy_loss(
+                    policy, ref, behavior, batch, torch.from_numpy(targets).to(device), r
+                )
+        else:
+            ctx_starts, ctx_lengths = sample_contexts(store, starts, lengths, r.batch_size, rng)
+            batch = to_tensors(
+                store.gather(ctx_starts, ctx_lengths, seq_len, bounds.train_end), device
+            )
+            next_item = torch.from_numpy(
+                np.asarray(store.columns["item_idx"])[ctx_starts + ctx_lengths].astype(np.int64)
+            ).to(device)
+            with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
+                loss, step_stats = policy_loss(
+                    policy, ref, rm, reward, batch, next_item, r, generator
+                )
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
