@@ -229,11 +229,13 @@ def test_nextk_pipeline(tmp_path):
 
     per_user = nextk_per_user(
         cfg, prepared, device, policies={"pi_ref_nextk": (None, True), "pi_ref_topk": (None, False),
-        "rl": (policy_path, True)}, searches={"search": (0.1, True), "greedy_r": (0.0, True)},
+        "rl": (policy_path, True)}, searches={"search": (0.1, True), "greedy_r": (0.0, True),
+        "search_topk": (0.1, False), "search_ref": (1e9, False)},
         best_of={"bon4": 4}, extra={"rr": lambda ev: reranker_lists(ev, 0.1)},
     )  # fmt: skip
     assert set(per_user["method"]) == {
-        "pi_ref_nextk", "pi_ref_topk", "rl", "search", "greedy_r", "bon4", "rr"
+        "pi_ref_nextk", "pi_ref_topk", "rl", "search", "greedy_r", "search_topk", "search_ref",
+        "bon4", "rr",
     }  # fmt: skip
     for column in ("ndcg@10", "proxy_slate@10", "gold_slate@10", "proxy_ratio@10", "artists@10"):
         assert per_user[column].is_not_null().all()
@@ -242,6 +244,10 @@ def test_nextk_pipeline(tmp_path):
 
     ref_topk = per_user.filter(method="pi_ref_topk")
     assert ref_topk["kl_ref"].sum() == 0
+    # without appending and with a negligible tilt the search is the Top-K list of pi_ref
+    search_ref = per_user.filter(method="search_ref")
+    for column in ("ndcg@10", "proxy_slate@10", "artists@10"):
+        np.testing.assert_allclose(search_ref[column], ref_topk[column], rtol=1e-5)
     _ = policy_eval
     # greedy by the reward alone maximises the first position's reward among the candidates
     search = per_user.filter(method="greedy_r")["proxy_slate@10"].mean()
